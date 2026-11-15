@@ -9,7 +9,7 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
 $ExePath = Join-Path $ProjectRoot "dist\Holdem.exe"
 $CardAssetsPath = Join-Path $ProjectRoot "assets\cards"
-# Client entry point; it is added in milestone 6 (tkinter client).
+$SmallCardAssetsPath = Join-Path $ProjectRoot "assets\cards_small"
 $EntryScript = "src\holdem\client\app.py"
 
 if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot $EntryScript))) {
@@ -63,6 +63,10 @@ if ($RunningExe) {
 if ($LASTEXITCODE -ne 0) {
     throw "Card image preparation failed with exit code $LASTEXITCODE."
 }
+& $CondaExe run -n $EnvName python scripts\prepare_card_images.py --output-dir assets\cards_small --width 60 --height 84
+if ($LASTEXITCODE -ne 0) {
+    throw "Small card image preparation failed with exit code $LASTEXITCODE."
+}
 
 & $CondaExe run -n $EnvName python -m PyInstaller `
     --noconfirm `
@@ -72,6 +76,7 @@ if ($LASTEXITCODE -ne 0) {
     --name Holdem `
     --specpath build `
     --add-data "$CardAssetsPath;assets\cards" `
+    --add-data "$SmallCardAssetsPath;assets\cards_small" `
     --paths src `
     $EntryScript
 
