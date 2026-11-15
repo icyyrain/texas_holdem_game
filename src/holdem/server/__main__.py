@@ -8,6 +8,7 @@ import logging
 import os
 
 from holdem import protocol
+from holdem.bots import POLICIES
 from holdem.core.table import TableConfig
 from holdem.server.app import start_server
 
@@ -26,7 +27,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-buy-in", type=int, help="default 20 big blinds")
     parser.add_argument("--max-buy-in", type=int, help="default 100 big blinds")
     parser.add_argument("--seats", type=int, default=9, help="2 to 9 (default 9)")
-    parser.add_argument("--bots", type=int, default=0, help="random bots to seat (default 0)")
+    parser.add_argument("--bots", type=int, default=0, help="bots to seat (default 0)")
+    parser.add_argument("--bot-style", choices=sorted(POLICIES), default="smart", help="how bots play (default smart)")
     parser.add_argument("--hand-delay", type=float, default=3.0, help="seconds between hands (default 3)")
     parser.add_argument("--bot-think", type=float, default=1.0, help="seconds a bot waits before acting (default 1)")
     parser.add_argument("--action-timeout", type=float, default=30.0, help="seconds to act before an automatic check or fold (default 30)")
@@ -64,6 +66,7 @@ async def serve_forever(args: argparse.Namespace) -> None:
         hand_delay=args.hand_delay,
         bot_think=args.bot_think,
         reconnect_grace=args.reconnect_grace,
+        bot_policy=POLICIES[args.bot_style],
     )
     config = args.config
     log.info(

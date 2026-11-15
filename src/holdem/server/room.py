@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from holdem import protocol
-from holdem.bots import BotPlayer
+from holdem.bots import BotPlayer, Policy, random_action
 from holdem.core.betting import Action, IllegalActionError
 from holdem.core.cards import Deck
 from holdem.core.table import HandState, Seat, Table, TableConfig
@@ -171,12 +171,14 @@ class Room:
         member = self.members.get(player_id)
         return member is not None and member.participant is not None
 
-    def add_bot(self, nickname: str, rng: random.Random | None = None, think: float = 1.0) -> BotPlayer:
-        """Seat a random bot at the first free seat with the maximum buy-in."""
+    def add_bot(
+        self, nickname: str, rng: random.Random | None = None, think: float = 1.0, policy: Policy = random_action,
+    ) -> BotPlayer:
+        """Seat a bot at the first free seat with the maximum buy-in."""
         free = next((index for index, seat in enumerate(self.table.seats) if seat is None), None)
         if free is None:
             raise ValueError("the table is full")
-        bot = BotPlayer(self, rng=rng, think=think)
+        bot = BotPlayer(self, policy=policy, rng=rng, think=think)
         bot.player_id = self.join(bot, nickname, self.password).player_id
         self.table.sit(bot.player_id, free, self.table.config.max_buy_in)
         self._after_change()

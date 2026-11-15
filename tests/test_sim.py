@@ -1,6 +1,6 @@
 import pytest
 
-from holdem import sim
+from holdem import sim, strategy
 from holdem.core.betting import Action, LegalActions
 
 FOLD, CHECK, CALL, BET, RAISE, ALL_IN = Action
@@ -142,11 +142,16 @@ def test_table_view_marks_positions_and_the_player_to_act():
     assert "  BB P3" in view
 
 
-def test_all_bot_game_runs_without_prompts_and_keeps_chips():
+@pytest.mark.parametrize("style, hands", [("random", 30), ("smart", 10)])
+def test_all_bot_game_runs_without_prompts_and_keeps_chips(style, hands, monkeypatch):
+    # Keep the smart bots' simulations small; the strategy has its own tests.
+    monkeypatch.setattr(strategy, "MAX_EVALUATIONS", 60)
+    monkeypatch.setattr(strategy, "MIN_TRIALS", 20)
     script = Script()
 
     code = sim.run(
-        ["--players", "6", "--bots", "1,2,3,4,5,6", "--hands", "30", "--seed", "3", "--stack", "50"],
+        ["--players", "6", "--bots", "1,2,3,4,5,6", "--hands", str(hands), "--seed", "3", "--stack", "50",
+         "--bot-style", style],
         input_fn=script.input,
         out=script.print,
     )
@@ -161,7 +166,7 @@ def test_all_bot_game_runs_without_prompts_and_keeps_chips():
 
 @pytest.mark.parametrize(
     "argv",
-    [["--players", "1"], ["--players", "10"], ["--bots", "4"], ["--bots", "x"], ["--blinds", "2/1"], ["--blinds", "1-2"]],
+    [["--players", "1"], ["--players", "10"], ["--bots", "4"], ["--bots", "x"], ["--bot-style", "genius"], ["--blinds", "2/1"], ["--blinds", "1-2"]],
 )
 def test_bad_arguments_exit_with_an_error(argv, capsys):
     with pytest.raises(SystemExit) as exit_info:

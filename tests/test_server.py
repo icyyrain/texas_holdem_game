@@ -252,12 +252,14 @@ def test_command_line_defaults_and_validation(monkeypatch):
     assert (args.config.min_buy_in, args.config.max_buy_in) == (200, 1000)
     assert (args.host, args.port, args.password, args.bots) == ("0.0.0.0", 8765, "pw", 2)
     assert (args.config.action_timeout, args.reconnect_grace) == (30.0, 120.0)
+    assert args.bot_style == "smart"
+    assert parse_args(["--bot-style", "random"]).bot_style == "random"
     args = parse_args(["--action-timeout", "15", "--reconnect-grace", "0"])
     assert (args.config.action_timeout, args.reconnect_grace) == (15.0, 0.0)
 
     for argv in (
         ["--blinds", "10/5"], ["--blinds", "x"], ["--seats", "12"], ["--bots", "10"],
-        ["--action-timeout", "0"], ["--reconnect-grace", "-1"],
+        ["--action-timeout", "0"], ["--reconnect-grace", "-1"], ["--bot-style", "genius"],
     ):
         with pytest.raises(SystemExit):
             parse_args(argv)

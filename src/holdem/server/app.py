@@ -10,9 +10,11 @@ from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
 from holdem import protocol
+from holdem.bots import Policy
 from holdem.core.cards import Deck
 from holdem.core.table import TableConfig
 from holdem.server.room import JoinError, Member, Room
+from holdem.strategy import smart_action
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +130,7 @@ async def start_server(
     bot_think: float = 1.0,
     deck_factory: Callable[[], Deck] | None = None,
     reconnect_grace: float = 120.0,
+    bot_policy: Policy | None = None,
 ) -> tuple[Server, Room]:
     """Start listening on the running loop. ``port=0`` picks a free port (see ``server.sockets``)."""
     loop = asyncio.get_running_loop()
@@ -136,6 +139,6 @@ async def start_server(
         clock=loop.time, reconnect_grace=reconnect_grace,
     )
     for number in range(1, bots + 1):
-        room.add_bot(f"Bot {number}", think=bot_think)
+        room.add_bot(f"Bot {number}", think=bot_think, policy=bot_policy or smart_action)
     server = await serve(GameServer(room).handler, host, port, max_size=protocol.MAX_MESSAGE_BYTES)
     return server, room

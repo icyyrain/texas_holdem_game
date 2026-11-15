@@ -4,10 +4,11 @@ import random
 
 import pytest
 
-from holdem import protocol
+from holdem import protocol, strategy
 from holdem.core.cards import Deck
 from holdem.core.table import TableConfig
 from holdem.server.room import JoinError, Room
+from holdem.strategy import smart_action
 
 
 class FakeClock:
@@ -512,3 +513,36 @@ def test_bots_play_through_the_same_interface_and_keep_chips():
     seats = [seat for seat in room.table.seats if seat is not None]
     in_pots = sum(p.total_bet for p in room.table.hand.players.values()) if room.table.hand_in_progress else 0
     assert sum(seat.stack for seat in seats) + in_pots == 3 * 200 + sum(rebuys)
+
+
+def test_smart_bots_play_hands_in_a_room(monkeypatch):
+    monkeypatch.setattr(strategy, "MAX_EVALUATIONS", 60)
+    monkeypatch.setattr(strategy, "MIN_TRIALS", 20)
+    room, clock = make_room()
+    for name in ("bot1", "bot2", "bot3"):
+        room.add_bot(name, rng=random.Random(name), think=0, policy=smart_action)
+    _, watcher = join(room, "watcher")
+
+    for _ in range(5000):
+        if room.hand_number > 10 or not clock.step():
+            break
+
+    assert room.hand_number > 10
+    assert not watcher.of_type("error")
+
+
+def test_a_bot_whose_turn_passed_while_thinking_does_nothing(monkeypatch):
+    room, clock = make_room()
+    bot = room.add_bot("slow", think=40)  # longer than the 30 second action timer
+    player_id, client = join(room, "alice")
+    room.handle(player_id, protocol.sit(1, 100))
+    clock.run()
+    assert room.table.hand.to_act == room.table.seat_of(bot.player_id).index
+    handled = []
+    monkeypatch.setattr(room, "handle", lambda *args: handled.append(args))
+
+    clock.advance(30)  # the room acts for the bot and marks it away
+    clock.advance(10)  # the bot wakes up
+
+    assert room.table.seats[0].away
+    assert handled == []

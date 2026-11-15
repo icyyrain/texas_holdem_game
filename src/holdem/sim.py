@@ -1,7 +1,7 @@
 """Hot-seat simulator for checking the rules by hand.
 
 Every seat plays from this terminal and all hole cards are shown. Seats listed in
-``--bots`` pick random legal actions.
+``--bots`` are played by the computer (``--bot-style smart`` or ``random``).
 """
 
 from __future__ import annotations
@@ -12,10 +12,11 @@ import re
 import sys
 from typing import Callable, Iterable, Mapping
 
-from holdem.bots import random_action
+from holdem.bots import POLICIES
 from holdem.core.betting import Action, LegalActions
 from holdem.core.cards import Card, Deck
 from holdem.core.table import Event, HandState, Table, TableConfig
+from holdem.strategy import situation_for
 from holdem.i18n import translate
 
 FOLD, CHECK, CALL, BET, RAISE, ALL_IN = Action
@@ -163,7 +164,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--players", type=int, default=3, help="2 to 9 (default 3)")
     parser.add_argument("--stack", type=int, default=200, help="starting chips (default 200)")
     parser.add_argument("--blinds", default="1/2", help="small/big (default 1/2)")
-    parser.add_argument("--bots", default="", help="comma-separated player numbers that act randomly, e.g. 2,3")
+    parser.add_argument("--bots", default="", help="comma-separated player numbers the computer plays, e.g. 2,3")
+    parser.add_argument("--bot-style", choices=sorted(POLICIES), default="smart", help="how bots play (default smart)")
     parser.add_argument("--hands", type=int, help="stop after this many hands")
     parser.add_argument("--seed", type=int, help="seed the shuffle and the bots for a repeatable game")
     args = parser.parse_args(argv)
@@ -234,7 +236,7 @@ def run(
                 seat = hand.to_act
                 legal = hand.legal_actions(seat)
                 if seat in args.bot_seats:
-                    action, amount = random_action(legal, rng)
+                    action, amount = POLICIES[args.bot_style](situation_for(hand, seat), rng)
                 else:
                     out(format_table(hand, names))
                     action, amount = ask_action(names[seat], legal, input_fn, out)
