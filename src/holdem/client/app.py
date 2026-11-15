@@ -53,6 +53,8 @@ from holdem.client.layout import (
     TOP_RAIL_BOTTOM,
     WIDTH,
     Point,
+    bet_steps,
+    nearest_step,
     preset_amount,
     seat_positions,
     toward_center,
@@ -143,7 +145,9 @@ class HoldemApp(tk.Tk):
                 ("join_port", str(protocol.DEFAULT_PORT)), ("join_password", ""),
             )
         }
-        self.raise_var = tk.IntVar(self, 0)
+        # The raise slider picks an index into raise_steps (big-blind steps, see layout.bet_steps).
+        self.raise_index = tk.IntVar(self, 0)
+        self.raise_steps: list[int] = [0]
 
         self.canvas = tk.Canvas(self, width=WIDTH, height=HEIGHT, highlightthickness=0, bd=0, bg=FELT_EDGE)
         self.canvas.pack(fill="both", expand=True)
@@ -469,7 +473,8 @@ class HoldemApp(tk.Tk):
         elif kind == "your_turn":
             self.turn = message
             if message["min_raise_to"] is not None:
-                self.raise_var.set(message["min_raise_to"])
+                self.raise_steps = self._steps_for_turn(message)
+                self.raise_index.set(0)
             self._update_controls()
 
     def _show_error(self, text: str) -> None:
@@ -508,7 +513,7 @@ class HoldemApp(tk.Tk):
             for index, (_, fraction) in enumerate(PRESETS)
         ]
         self.raise_scale = tk.Scale(
-            canvas, from_=0, to=1, orient=tk.HORIZONTAL, variable=self.raise_var, showvalue=False, length=210,
+            canvas, from_=0, to=1, orient=tk.HORIZONTAL, variable=self.raise_index, showvalue=False, length=210,
             command=lambda _value: self._update_controls(), bg=PANEL, troughcolor="#0f3a24", activebackground=GOLD,
             highlightthickness=0, sliderrelief="flat", bd=0,
         )
@@ -559,13 +564,18 @@ class HoldemApp(tk.Tk):
         can_raise = bool(actions & {"bet", "raise"})
         key = "btn_bet" if "bet" in actions else "btn_raise"
         if can_raise:
-            low, high = turn["min_raise_to"], turn["max_raise_to"]
-            # Only an all-in is possible when low == high; the slider has nothing to choose then.
-            self.raise_scale.config(from_=low, to=high, state=tk.NORMAL if high > low else tk.DISABLED)
-            amount = min(max(self.raise_var.get(), low), high)
-            if amount != self.raise_var.get():
-                self.raise_var.set(amount)
-            label = self.t("label_all_in", amount=amount) if amount == high else self.t(key, amount=amount)
+            steps = self._steps_for_turn(turn)
+            if steps != self.raise_steps:
+                amount = self._raise_amount()
+                self.raise_steps = steps
+                self._set_raise_amount(amount)
+            # Only an all-in is possible when there is a single step; the slider has nothing to choose then.
+            self.raise_scale.config(from_=0, to=len(steps) - 1, state=tk.NORMAL if len(steps) > 1 else tk.DISABLED)
+            index = min(max(self.raise_index.get(), 0), len(steps) - 1)
+            if index != self.raise_index.get():
+                self.raise_index.set(index)
+            amount = steps[index]
+            label = self.t("label_all_in", amount=amount) if amount == turn["max_raise_to"] else self.t(key, amount=amount)
             self.raise_button.set_text(label, self._font(15, "bold"))
         else:
             self.raise_scale.config(state=tk.DISABLED)
@@ -583,6 +593,17 @@ class HoldemApp(tk.Tk):
         away = seat is not None and seat["away"]
         self.away_button.set_text(self.t("btn_sit_back" if away else "btn_sit_out"), self._font(14, "bold"))
         self.away_button.set_enabled(online and seat is not None)
+
+    def _steps_for_turn(self, turn: protocol.Message) -> list[int]:
+        big_blind = self.config_info["big_blind"] if self.config_info else 1
+        return bet_steps(turn["min_raise_to"], turn["max_raise_to"], big_blind)
+
+    def _raise_amount(self) -> int:
+        index = min(max(self.raise_index.get(), 0), len(self.raise_steps) - 1)
+        return self.raise_steps[index]
+
+    def _set_raise_amount(self, amount: int) -> None:
+        self.raise_index.set(nearest_step(self.raise_steps, amount))
 
     # Table actions
 
@@ -608,7 +629,7 @@ class HoldemApp(tk.Tk):
     def bet_or_raise(self) -> None:
         turn = self._active_turn()
         if turn is not None:
-            self._send_action("bet" if "bet" in turn["actions"] else "raise", self.raise_var.get())
+            self._send_action("bet" if "bet" in turn["actions"] else "raise", self._raise_amount())
 
     def preset(self, fraction: float | None) -> None:
         turn = self._active_turn()
@@ -622,7 +643,7 @@ class HoldemApp(tk.Tk):
             pot = sum(pot["amount"] for pot in self.state["hand"]["pots"]) + sum(seat["bet"] for seat in seats)
             my_bet = self.state["seats"][turn["seat"]]["bet"]
             amount = preset_amount(fraction, pot, my_bet, turn["call_amount"], low, high)
-        self.raise_var.set(amount)
+        self._set_raise_amount(amount)
         self._update_controls()
 
     def click_seat(self, index: int) -> None:

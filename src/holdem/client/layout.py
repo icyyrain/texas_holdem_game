@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import math
 
 WIDTH, HEIGHT = 1200, 720
@@ -42,3 +43,22 @@ def preset_amount(fraction: float, pot: int, my_bet: int, call_amount: int, min_
     """
     target = my_bet + call_amount + round(fraction * (pot + call_amount))
     return max(min_to, min(max_to, target))
+
+
+def bet_steps(min_to: int, max_to: int, step: int) -> list[int]:
+    """Amounts the raise slider stops at: the legal minimum, every multiple of ``step`` (the big
+    blind) above it, and the all-in amount. A convenience only; any amount in range is legal."""
+    if max_to <= min_to:
+        return [min_to]
+    first = (min_to // step + 1) * step
+    return [min_to, *range(first, max_to, step), max_to]
+
+
+def nearest_step(steps: list[int], amount: int) -> int:
+    """Index of the step closest to ``amount`` (the lower one on a tie)."""
+    index = bisect.bisect_left(steps, amount)
+    if index == 0:
+        return 0
+    if index == len(steps):
+        return len(steps) - 1
+    return index if steps[index] - amount < amount - steps[index - 1] else index - 1

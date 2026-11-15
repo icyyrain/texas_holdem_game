@@ -5,7 +5,7 @@ import pytest
 
 from holdem import protocol
 from holdem.client.app import HoldemApp
-from holdem.client.layout import HEIGHT, TABLE_CENTER, WIDTH, preset_amount, seat_positions
+from holdem.client.layout import HEIGHT, TABLE_CENTER, WIDTH, bet_steps, nearest_step, preset_amount, seat_positions
 from holdem.core.betting import Action, LegalActions
 from holdem.core.table import TableConfig
 
@@ -191,6 +191,25 @@ def test_preset_amount(fraction, pot, my_bet, call, low, high, expected):
     assert preset_amount(fraction, pot, my_bet, call, low, high) == expected
 
 
+@pytest.mark.parametrize(
+    "low, high, step, expected",
+    [
+        (4, 12, 2, [4, 6, 8, 10, 12]),
+        (5, 12, 2, [5, 6, 8, 10, 12]),
+        (18, 25, 2, [18, 20, 22, 24, 25]),
+        (20, 20, 2, [20]),
+        (10, 13, 5, [10, 13]),
+    ],
+)
+def test_bet_steps_keep_the_minimum_and_all_in(low, high, step, expected):
+    assert bet_steps(low, high, step) == expected
+
+
+@pytest.mark.parametrize("amount, index", [(1, 0), (4, 0), (5, 0), (6, 1), (7, 1), (11, 3), (13, 4), (99, 4)])
+def test_nearest_step(amount, index):
+    assert nearest_step([4, 6, 8, 10, 12], amount) == index
+
+
 # Lobby
 
 
@@ -353,12 +372,38 @@ def test_fold_and_call_send_actions_once(app, scheduler):
 def test_raise_uses_the_slider_amount(app, scheduler):
     network = your_turn_ready(app, scheduler)
 
-    app.raise_var.set(30)
+    app.raise_index.set(13)  # 4, 6, 8, ... in big blinds of 2
     app._update_controls()
     assert app.raise_button.text == "加注到 30"
     app.bet_or_raise()
 
     assert network.sent == [protocol.action("raise", 30)]
+
+
+def test_the_slider_moves_in_big_blinds_and_keeps_the_minimum_and_all_in(app, scheduler):
+    legal = LegalActions(frozenset({Action.FOLD, Action.CALL, Action.RAISE, Action.ALL_IN}), call_amount=4, min_raise_to=9, max_raise_to=97)
+    your_turn_ready(app, scheduler, legal)
+
+    assert app.raise_steps == [9, *range(10, 97, 2), 97]
+    assert (app.raise_scale.cget("from"), app.raise_scale.cget("to")) == (0, len(app.raise_steps) - 1)
+    assert app.raise_button.text == "加注到 9"
+    app.raise_index.set(1)
+    app._update_controls()
+    assert app.raise_button.text == "加注到 10"
+    app.raise_index.set(len(app.raise_steps) - 1)
+    app._update_controls()
+    assert app.raise_button.text == "全下 97"
+
+
+def test_pot_presets_snap_to_the_nearest_step(app, scheduler):
+    your_turn_ready(app, scheduler)
+
+    app.preset(0.75)
+
+    # 1 + 1 + round(0.75 * 4) = 5 sits between the steps 4 and 6 and goes down; a pot raise lands on 6.
+    assert app.raise_button.text == "加注到 4"
+    app.preset(1.0)
+    assert app.raise_button.text == "加注到 6"
 
 
 def test_raising_everything_is_labelled_all_in(app, scheduler):
@@ -377,7 +422,7 @@ def test_pot_presets_count_the_bets_on_the_table(app, scheduler):
     app.preset(1.0)
 
     # Pot 3 in bets; calling 1 makes 4, so a pot raise goes to 2 + 4.
-    assert app.raise_var.get() == 6
+    assert app._raise_amount() == 6
 
 
 def test_check_is_offered_when_free(app, scheduler):
