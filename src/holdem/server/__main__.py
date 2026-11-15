@@ -25,6 +25,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--bots", type=int, default=0, help="random bots to seat (default 0)")
     parser.add_argument("--hand-delay", type=float, default=3.0, help="seconds between hands (default 3)")
     parser.add_argument("--bot-think", type=float, default=1.0, help="seconds a bot waits before acting (default 1)")
+    parser.add_argument("--action-timeout", type=float, default=30.0, help="seconds to act before an automatic check or fold (default 30)")
+    parser.add_argument(
+        "--reconnect-grace", type=float, default=120.0, help="seconds a disconnected player keeps their seat (default 120)"
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -35,11 +39,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             min_buy_in=args.min_buy_in if args.min_buy_in is not None else 20 * big,
             max_buy_in=args.max_buy_in if args.max_buy_in is not None else 100 * big,
             max_seats=args.seats,
+            action_timeout=args.action_timeout,
         )
     except ValueError as error:
         parser.error(f"bad table settings: {error}")
     if not 0 <= args.bots <= args.seats:
         parser.error("--bots must be between 0 and the number of seats")
+    if args.reconnect_grace < 0:
+        parser.error("--reconnect-grace cannot be negative")
     return args
 
 
@@ -52,12 +59,13 @@ async def serve_forever(args: argparse.Namespace) -> None:
         bots=args.bots,
         hand_delay=args.hand_delay,
         bot_think=args.bot_think,
+        reconnect_grace=args.reconnect_grace,
     )
     config = args.config
     log.info(
-        "listening on %s:%d · blinds %d/%d · buy-in %d-%d · %d seats%s",
+        "listening on %s:%d · blinds %d/%d · buy-in %d-%d · %d seats · %gs to act%s",
         args.host, args.port, config.small_blind, config.big_blind, config.min_buy_in, config.max_buy_in,
-        config.max_seats, " · password set" if args.password else "",
+        config.max_seats, config.action_timeout, " · password set" if args.password else "",
     )
     await server.serve_forever()
 

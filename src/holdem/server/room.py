@@ -3,6 +3,11 @@
 Anything that plays a seat is a ``Participant``: a WebSocket connection or an in-process bot.
 The room validates every request, drives the hand and sends each participant its own view.
 It is single-threaded; the server calls it from its asyncio loop.
+
+A seated player who disconnects keeps the seat for ``reconnect_grace`` seconds and can take it
+back by sending their token in ``hello``. Each turn has a timer of ``config.action_timeout``
+seconds, which also runs while the player is offline; when it expires the room checks or folds
+for them and marks them away. Away seats sit out new hands and are played automatically.
 """
 
 from __future__ import annotations
@@ -10,6 +15,7 @@ from __future__ import annotations
 import logging
 import random
 import secrets
+import time
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
@@ -40,7 +46,8 @@ class Member:
     player_id: str
     name: str
     token: str
-    participant: Participant
+    participant: Participant | None  # None while disconnected
+    session: int = 0  # bumped on every disconnect and rejoin, so stale timers can tell
 
 
 class Room:
@@ -51,29 +58,46 @@ class Room:
         password: str | None = None,
         hand_delay: float = 3.0,
         deck_factory: Callable[[], Deck] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        reconnect_grace: float = 120.0,
     ):
+        """``clock`` must count seconds the same way ``schedule`` does."""
         self.table = Table(config, deck_factory) if deck_factory else Table(config)
         self.schedule = schedule
+        self.clock = clock
         self.password = password or None
         self.hand_delay = hand_delay
+        self.reconnect_grace = reconnect_grace
         self.members: dict[str, Member] = {}
         self.hand_number = 0
         self._names: dict[str, str] = {}
         self._events_sent = 0
         self._hand_open = False
         self._start_pending = False
-        self._last_prompt: tuple[int, int, int] | None = None
+        self._turn: tuple[int, int, int] | None = None  # (hand number, seat, events so far)
+        self._deadline = 0.0
+        # Players the room marked away because they were offline; coming back clears it.
+        self._away_offline: set[str] = set()
 
     # Joining and leaving
 
     def join(
         self, participant: Participant, nickname: str, password: str | None = None,
-        version: int = protocol.PROTOCOL_VERSION,
+        version: int = protocol.PROTOCOL_VERSION, token: str | None = None,
     ) -> Member:
+        """Admit a participant. A known ``token`` takes back that player's place (and seat) instead,
+        replacing any connection still attached to it; an unknown one is ignored."""
         if version != protocol.PROTOCOL_VERSION:
             raise JoinError("version_mismatch", f"server speaks protocol {protocol.PROTOCOL_VERSION}")
         if self.password is not None and not secrets.compare_digest((password or "").encode(), self.password.encode()):
             raise JoinError("bad_password", "wrong room password")
+        if token:
+            member = next(
+                (m for m in self.members.values() if secrets.compare_digest(m.token.encode(), token.encode())), None
+            )
+            if member is not None:
+                self._rejoin(member, participant)
+                return member
         if any(member.name == nickname for member in self.members.values()):
             raise JoinError("nickname_taken", f"someone here is already called {nickname}")
         member = Member(secrets.token_hex(8), nickname, secrets.token_urlsafe(16), participant)
@@ -84,15 +108,68 @@ class Room:
         log.info("%s joined", nickname)
         return member
 
-    def disconnect(self, player_id: str) -> None:
-        """The participant is gone; its seat is given up (immediately, or when its hand ends)."""
-        member = self.members.pop(player_id, None)
-        if member is None:
+    def _rejoin(self, member: Member, participant: Participant) -> None:
+        member.participant = participant
+        member.session += 1
+        seat = self.table.seat_of(member.player_id)
+        if seat is not None and member.player_id in self._away_offline:
+            self._away_offline.discard(member.player_id)
+            seat.away = False
+        log.info("%s reconnected", member.name)
+        participant.deliver(protocol.welcome(member.player_id, member.token, self.table.config))
+        turn = self._turn
+        self._after_change()  # everyone sees them back; they get a fresh table_state
+        # A turn that was already running when they came back is sent again, with its time left.
+        if seat is not None and self._seat_to_act() is seat and self._turn == turn and not self._plays_itself(seat):
+            self._send_turn(seat)
+
+    def disconnect(self, player_id: str, participant: Participant | None = None) -> None:
+        """The participant is gone. Someone without a seat leaves at once; a seated player keeps
+        the seat for ``reconnect_grace`` seconds. With ``participant``, only that connection counts:
+        a connection replaced by a rejoin can hang up without affecting the new one."""
+        member = self.members.get(player_id)
+        if member is None or member.participant is None:
+            return
+        if participant is not None and member.participant is not participant:
             return
         log.info("%s disconnected", member.name)
-        if self.table.seat_of(player_id) is not None:
-            self.table.leave(player_id)
+        seat = self.table.seat_of(player_id)
+        if seat is None or seat.leaving:
+            del self.members[player_id]
+        else:
+            member.participant = None
+            member.session += 1
+            if not self._still_playing(seat):
+                self._set_away_offline(seat)
+            session = member.session
+            self.schedule(self.reconnect_grace, lambda: self._expire(member, session))
         self._after_change()
+
+    def _expire(self, member: Member, session: int) -> None:
+        if member.session != session or self.members.get(member.player_id) is not member:
+            return
+        log.info("%s did not come back", member.name)
+        del self.members[member.player_id]
+        self._away_offline.discard(member.player_id)
+        if self.table.seat_of(member.player_id) is not None:
+            self.table.leave(member.player_id)
+        self._after_change()
+
+    def _still_playing(self, seat: Seat) -> bool:
+        """True while the seat holds live cards in the current hand."""
+        if not self.table.hand_in_progress:
+            return False
+        player = self.table.hand.players.get(seat.index)
+        return player is not None and player.seat is seat and not player.folded
+
+    def _set_away_offline(self, seat: Seat) -> None:
+        if not seat.away:
+            seat.away = True
+            self._away_offline.add(seat.player_id)
+
+    def _connected(self, player_id: str) -> bool:
+        member = self.members.get(player_id)
+        return member is not None and member.participant is not None
 
     def add_bot(self, nickname: str, rng: random.Random | None = None, think: float = 1.0) -> BotPlayer:
         """Seat a random bot at the first free seat with the maximum buy-in."""
@@ -120,6 +197,9 @@ class Room:
                 self.table.leave(player_id)
             elif kind == "rebuy":
                 self.table.rebuy(player_id, message["amount"])
+            elif kind == "away":
+                self.table.set_away(player_id, message["away"])
+                self._away_offline.discard(player_id)
             elif kind == "action":
                 self._act(player_id, message["action"], message["amount"])
             else:
@@ -149,14 +229,18 @@ class Room:
                 self._hand_open = False
                 for player_id in self.table.finish_hand():
                     log.info("%s left the table", self._names.get(player_id, player_id))
+                for seat in self.table.seats:
+                    if seat is not None and not self._connected(seat.player_id):
+                        self._set_away_offline(seat)
             seat = self._seat_to_act()
             if seat is not None and self._plays_itself(seat):
                 self._auto_act(seat)
                 continue
             break
+        new_turn = seat is not None and self._start_turn(seat)
         self._broadcast_state()
-        if seat is not None:
-            self._prompt(seat)
+        if new_turn:
+            self._send_turn(seat)
         self._schedule_hand()
 
     def _seat_to_act(self) -> Seat | None:
@@ -172,14 +256,44 @@ class Room:
         action = Action.CHECK if Action.CHECK in hand.legal_actions(seat.index).actions else Action.FOLD
         hand.apply(seat.index, action)
 
-    def _prompt(self, seat: Seat) -> None:
-        hand = self.table.hand
-        key = (self.hand_number, seat.index, len(hand.events))
-        if key == self._last_prompt:
+    def _turn_key(self) -> tuple[int, int, int] | None:
+        if not self.table.hand_in_progress:
+            return None
+        return self.hand_number, self.table.hand.to_act, len(self.table.hand.events)
+
+    def _start_turn(self, seat: Seat) -> bool:
+        """Start the timer for the seat to act; False if this turn was already started."""
+        key = self._turn_key()
+        if key == self._turn:
+            return False
+        self._turn = key
+        timeout = self.table.config.action_timeout
+        self._deadline = self.clock() + timeout
+        self.schedule(timeout, lambda: self._time_out(key))
+        return True
+
+    def _time_left(self) -> float | None:
+        if self._turn is None or self._turn != self._turn_key():
+            return None
+        return max(0.0, round(self._deadline - self.clock(), 1))
+
+    def _send_turn(self, seat: Seat) -> None:
+        participant = self.members[seat.player_id].participant
+        if participant is not None:
+            legal = self.table.hand.legal_actions(seat.index)
+            participant.deliver(protocol.your_turn(self.hand_number, seat.index, legal, self._time_left()))
+
+    def _time_out(self, key: tuple[int, int, int]) -> None:
+        if key != self._turn or key != self._turn_key():
             return
-        self._last_prompt = key
-        message = protocol.your_turn(self.hand_number, seat.index, hand.legal_actions(seat.index))
-        self.members[seat.player_id].participant.deliver(message)
+        seat = self._seat_to_act()
+        log.info("%s ran out of time", self._names.get(seat.player_id, seat.player_id))
+        seat.away = True
+        if self._connected(seat.player_id):
+            self._away_offline.discard(seat.player_id)
+        else:
+            self._away_offline.add(seat.player_id)
+        self._after_change()  # the seat is away now, so it plays itself
 
     def _schedule_hand(self) -> None:
         if self._start_pending or self.table.hand_in_progress or self._ready_players() < 2:
@@ -202,7 +316,7 @@ class Room:
         return sum(
             1 for seat in self.table.seats
             if seat is not None and seat.stack > 0 and not seat.away and not seat.leaving
-            and seat.player_id in self.members
+            and self._connected(seat.player_id)
         )
 
     # Views
@@ -213,7 +327,8 @@ class Room:
             return
         for event in hand.events[self._events_sent:]:
             for member in self.members.values():
-                member.participant.deliver(protocol.event(self.hand_number, self._redact(event, member.player_id)))
+                if member.participant is not None:
+                    member.participant.deliver(protocol.event(self.hand_number, self._redact(event, member.player_id)))
         self._events_sent = len(hand.events)
 
     def _redact(self, event: protocol.Message, viewer: str) -> protocol.Message:
@@ -223,7 +338,8 @@ class Room:
 
     def _broadcast_state(self) -> None:
         for player_id, member in self.members.items():
-            member.participant.deliver(self._state_for(player_id))
+            if member.participant is not None:
+                member.participant.deliver(self._state_for(player_id))
 
     def _state_for(self, viewer: str) -> protocol.Message:
         hand = self.table.hand
@@ -244,6 +360,7 @@ class Room:
                 "stack": seat.stack,
                 "away": seat.away,
                 "leaving": seat.leaving,
+                "connected": self._connected(seat.player_id),
                 "in_hand": player is not None and self.table.hand_in_progress,
                 "folded": player is not None and player.folded,
                 "all_in": player is not None and not player.folded and seat.stack == 0,
@@ -263,6 +380,7 @@ class Room:
             "pots": [{"amount": pot.amount, "eligible": sorted(pot.eligible)} for pot in hand.pots],
             "current_bet": hand.current_bet,
             "to_act": hand.to_act,
+            "time_left": self._time_left(),
             "button": hand.button,
             "small_blind": hand.small_blind_seat,
             "big_blind": hand.big_blind_seat,

@@ -18,7 +18,10 @@ from websockets.exceptions import ConnectionClosed
 from holdem import protocol
 from holdem.sim import ALIASES, QUIT_WORDS, cards_text, describe_event, describe_options, parse_action
 
-HELP = "Commands: sit SEAT BUYIN · leave · rebuy AMOUNT · state · help · quit. On your turn: f, x, c, b N, r N, a."
+HELP = (
+    "Commands: sit SEAT BUYIN · leave · rebuy AMOUNT · away · back · state · help · quit. "
+    "On your turn: f, x, c, b N, r N, a."
+)
 
 
 class TextClient:
@@ -66,7 +69,8 @@ class TextClient:
     def turn_prompt(self) -> str:
         seat = self.state["seats"][self.turn["seat"]] if self.state else None
         cards = f" with {cards_text(seat['cards'])}" if seat and seat["cards"] else ""
-        return f"Your turn{cards}: {describe_options(protocol.legal_from_turn(self.turn))}"
+        time_left = f" ({self.turn['time_left']:.0f}s)" if self.turn["time_left"] is not None else ""
+        return f"Your turn{cards}{time_left}: {describe_options(protocol.legal_from_turn(self.turn))}"
 
     def render_state(self) -> list[str]:
         if self.state is None:
@@ -89,6 +93,7 @@ class TextClient:
                     ("folded", seat["folded"]),
                     ("all-in", seat["all_in"]),
                     ("away", seat["away"]),
+                    ("offline", not seat["connected"]),
                     ("leaving", seat["leaving"]),
                 ) if on
             ]
@@ -110,6 +115,8 @@ class TextClient:
             return None, self.render_state()
         if head == "leave":
             return protocol.leave(), []
+        if head in ("away", "back"):
+            return protocol.away(head == "away"), []
         if head in ("sit", "rebuy"):
             numbers = words[1:]
             expected = 2 if head == "sit" else 1

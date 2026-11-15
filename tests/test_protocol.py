@@ -17,6 +17,8 @@ from holdem.core.table import TableConfig
         protocol.action(Action.FOLD),
         protocol.action("raise", 40),
         protocol.rebuy(100),
+        protocol.away(True),
+        protocol.away(False),
     ],
 )
 def test_client_messages_round_trip(message):
@@ -24,7 +26,7 @@ def test_client_messages_round_trip(message):
 
 
 def test_optional_client_fields_default_to_none():
-    assert protocol.decode_client('{"type":"hello","version":1,"nickname":"a"}') == protocol.hello("a")
+    assert protocol.decode_client('{"type":"hello","version":2,"nickname":"a"}') == protocol.hello("a")
     assert protocol.decode_client('{"type":"action","action":"call"}') == protocol.action("call")
 
 
@@ -37,7 +39,7 @@ LEGAL = LegalActions(frozenset({Action.FOLD, Action.CALL, Action.RAISE}), call_a
         protocol.welcome("p1", "tok", TableConfig(1, 2, 40, 200)),
         protocol.table_state(2, [None, {"seat": 1, "name": "bob", "cards": None}], {"street": "flop", "board": ["AS"]}),
         protocol.event(4, {"type": "action", "seat": 1, "action": "call", "amount": 2, "to": 2, "all_in": False}),
-        protocol.your_turn(4, 1, LEGAL, deadline=123.5),
+        protocol.your_turn(4, 1, LEGAL, time_left=12.5),
         protocol.error("illegal_action", "not your turn"),
     ],
 )
@@ -74,6 +76,9 @@ def test_welcome_carries_version_and_config():
         '{"type":"sit","seat":1.0,"buy_in":100}',
         '{"type":"sit","seat":true,"buy_in":100}',
         '{"type":"rebuy","amount":null}',
+        '{"type":"away"}',
+        '{"type":"away","away":1}',
+        '{"type":"away","away":"no"}',
         '{"type":"action","action":"dance"}',
         '{"type":"action","action":"bet","amount":"10"}',
         '{"type":"hello","version":1}',

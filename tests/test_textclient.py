@@ -11,14 +11,14 @@ LEGAL = LegalActions(frozenset({Action.FOLD, Action.CALL, Action.RAISE}), call_a
 
 def seat(index, name, stack=100, cards=None, **flags):
     entry = {"seat": index, "player_id": name, "name": name, "stack": stack, "away": False, "leaving": False,
-             "in_hand": True, "folded": False, "all_in": False, "bet": 0, "cards": cards}
+             "connected": True, "in_hand": True, "folded": False, "all_in": False, "bet": 0, "cards": cards}
     return {**entry, **flags}
 
 
 def state(to_act=0):
     hand = {"number": 3, "street": "flop", "board": ["AH", "9C", "5S"], "pots": [{"amount": 12, "eligible": [0, 2]}],
             "current_bet": 4, "to_act": to_act, "button": 2, "small_blind": 0, "big_blind": 2, "complete": False}
-    seats = [seat(0, "alice", 94, ["AS", "AD"], bet=4), None, seat(2, "bob", 90, folded=True)]
+    seats = [seat(0, "alice", 94, ["AS", "AD"], bet=4), None, seat(2, "bob", 90, folded=True, away=True, connected=False)]
     return protocol.table_state(0, seats, hand)
 
 
@@ -30,7 +30,7 @@ def test_first_state_is_rendered_with_positions_and_own_cards():
     assert lines[0] == "Hand 3 · flop · board [A♥] [9♣] [5♠] · pot 12"
     assert lines[1] == "  Seat 1: alice 94 bet 4 [A♠] [A♦] (you, to act)"
     assert lines[2] == "  Seat 2: empty"
-    assert lines[3] == "  Seat 3: bob 90 (button, folded)"
+    assert lines[3] == "  Seat 3: bob 90 (button, folded, away, offline)"
     assert client.on_message(state()) == []
 
 
@@ -51,6 +51,7 @@ def test_your_turn_prompt_and_action_commands():
     assert client.on_message(protocol.your_turn(3, 0, LEGAL)) == [
         "Your turn with [A♠] [A♦]: fold (f) / call 2 (c) / raise to 4-100 (r N)"
     ]
+    assert client.on_message(protocol.your_turn(3, 0, LEGAL, time_left=17.6))[0].startswith("Your turn with [A♠] [A♦] (18s): ")
     assert client.command("r 2") == (None, ["raise must go to between 4 and 100"])
     assert client.command("r 10") == (protocol.action("raise", 10), [])
 
@@ -71,6 +72,8 @@ def test_table_commands():
     assert client.command("sit 3 150") == (protocol.sit(2, 150), [])
     assert client.command("rebuy 50") == (protocol.rebuy(50), [])
     assert client.command("leave") == (protocol.leave(), [])
+    assert client.command("away") == (protocol.away(True), [])
+    assert client.command("back") == (protocol.away(False), [])
     assert client.command("sit 3") == (None, ["Usage: sit SEAT BUYIN"])
     assert client.command("rebuy -5") == (None, ["Usage: rebuy AMOUNT"])
     assert client.command("dance")[1][0].startswith("Unknown command")

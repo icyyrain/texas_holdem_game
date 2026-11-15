@@ -28,6 +28,7 @@ class Connection:
         self.websocket = websocket
         self.outbox: asyncio.Queue[str | None] = asyncio.Queue()
         self._dropped = False
+        self._hang_up: str | None = None
 
     def deliver(self, message: protocol.Message) -> None:
         if self._dropped:
@@ -39,13 +40,18 @@ class Connection:
             return
         self.outbox.put_nowait(protocol.encode(message))
 
-    def close(self) -> None:
+    def close(self, hang_up: str | None = None) -> None:
+        """Stop sending. With ``hang_up``, close the socket with that reason once the queue is sent."""
+        if hang_up is not None and self._hang_up is None:
+            self._hang_up = hang_up
         self.outbox.put_nowait(None)
 
     async def pump(self) -> None:
         try:
             while (text := await self.outbox.get()) is not None:
                 await self.websocket.send(text)
+            if self._hang_up is not None:
+                await self.websocket.close(1000, self._hang_up)
         except ConnectionClosed:
             pass
 
@@ -53,6 +59,7 @@ class Connection:
 class GameServer:
     def __init__(self, room: Room):
         self.room = room
+        self.connections: dict[str, Connection] = {}
 
     async def handler(self, websocket: ServerConnection) -> None:
         connection = Connection(websocket)
@@ -61,12 +68,20 @@ class GameServer:
         try:
             member = await self._handshake(connection)
             if member is not None:
+                old = self.connections.get(member.player_id)
+                self.connections[member.player_id] = connection
+                if old is not None:
+                    # The same player joined again with their token, so the old connection is stale.
+                    old.deliver(protocol.error("replaced", "you joined again from another connection"))
+                    old.close(hang_up="replaced")
                 await self._serve(member, connection)
         except ConnectionClosed:
             pass
         finally:
             if member is not None:
-                self.room.disconnect(member.player_id)
+                self.room.disconnect(member.player_id, connection)
+                if self.connections.get(member.player_id) is connection:
+                    del self.connections[member.player_id]
             connection.close()
             await sender
 
@@ -76,7 +91,9 @@ class GameServer:
             message = protocol.decode_client(text)
             if message["type"] != "hello":
                 raise protocol.ProtocolError("the first message must be hello")
-            return self.room.join(connection, message["nickname"], message["password"], message["version"])
+            return self.room.join(
+                connection, message["nickname"], message["password"], message["version"], message["token"]
+            )
         except TimeoutError:
             return None
         except (protocol.ProtocolError, JoinError) as error:
@@ -85,6 +102,8 @@ class GameServer:
 
     async def _serve(self, member: Member, connection: Connection) -> None:
         async for text in connection.websocket:
+            if member.participant is not connection:
+                return  # replaced by a newer connection
             try:
                 message = protocol.decode_client(text)
                 if message["type"] == "hello":
@@ -108,10 +127,14 @@ async def start_server(
     hand_delay: float = 3.0,
     bot_think: float = 1.0,
     deck_factory: Callable[[], Deck] | None = None,
+    reconnect_grace: float = 120.0,
 ) -> tuple[Server, Room]:
     """Start listening on the running loop. ``port=0`` picks a free port (see ``server.sockets``)."""
     loop = asyncio.get_running_loop()
-    room = Room(config, loop.call_later, password=password, hand_delay=hand_delay, deck_factory=deck_factory)
+    room = Room(
+        config, loop.call_later, password=password, hand_delay=hand_delay, deck_factory=deck_factory,
+        clock=loop.time, reconnect_grace=reconnect_grace,
+    )
     for number in range(1, bots + 1):
         room.add_bot(f"Bot {number}", think=bot_think)
     server = await serve(GameServer(room).handler, host, port, max_size=protocol.MAX_MESSAGE_BYTES)

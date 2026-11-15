@@ -12,7 +12,7 @@ from typing import Any
 from holdem.core.betting import Action, LegalActions
 from holdem.core.table import TableConfig
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 DEFAULT_PORT = 8765
 MAX_MESSAGE_BYTES = 16 * 1024
 MAX_NICKNAME = 20
@@ -20,7 +20,7 @@ MAX_SECRET = 64
 
 Message = dict[str, Any]
 
-CLIENT_TYPES = ("hello", "sit", "leave", "action", "rebuy")
+CLIENT_TYPES = ("hello", "sit", "leave", "action", "rebuy", "away")
 SERVER_TYPES = ("welcome", "table_state", "event", "your_turn", "error")
 
 
@@ -42,6 +42,7 @@ _CLIENT_FIELDS: dict[str, dict[str, tuple[tuple[type, ...], bool]]] = {
     "leave": {},
     "action": {"action": ((str,), True), "amount": ((int, type(None)), False)},
     "rebuy": {"amount": ((int,), True)},
+    "away": {"away": ((bool,), True)},
 }
 
 
@@ -82,7 +83,7 @@ def decode_client(text: str | bytes) -> Message:
             message[name] = None
             continue
         value = message[name]
-        if isinstance(value, bool) or not isinstance(value, types):
+        if (isinstance(value, bool) and bool not in types) or not isinstance(value, types):
             raise ProtocolError(f"{kind}.{name} has the wrong type")
 
     if kind == "hello":
@@ -128,6 +129,11 @@ def rebuy(amount: int) -> Message:
     return {"type": "rebuy", "amount": amount}
 
 
+def away(away: bool) -> Message:
+    """Sit out from the next hand (True) or come back (False)."""
+    return {"type": "away", "away": away}
+
+
 # Server -> client
 
 
@@ -157,7 +163,8 @@ def event(hand_number: int, event: Message) -> Message:
     return {"type": "event", "hand": hand_number, "event": event}
 
 
-def your_turn(hand_number: int, seat: int, legal: LegalActions, deadline: float | None = None) -> Message:
+def your_turn(hand_number: int, seat: int, legal: LegalActions, time_left: float | None = None) -> Message:
+    """``time_left`` is the seconds left to act when the message was sent (clocks differ between machines)."""
     return {
         "type": "your_turn",
         "hand": hand_number,
@@ -166,7 +173,7 @@ def your_turn(hand_number: int, seat: int, legal: LegalActions, deadline: float 
         "call_amount": legal.call_amount,
         "min_raise_to": legal.min_raise_to,
         "max_raise_to": legal.max_raise_to,
-        "deadline": deadline,
+        "time_left": time_left,
     }
 
 

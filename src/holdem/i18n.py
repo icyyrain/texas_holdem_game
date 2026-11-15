@@ -85,6 +85,11 @@ TEXTS: dict[str, dict[str, str]] = {
         "error_bad_password": "房间密码不对",
         "error_nickname_taken": "这个昵称已经有人用了",
         "error_version_mismatch": "客户端和服务器版本不一致",
+        "error_replaced": "你在别处重新进入了这个房间",
+        "seat_offline": "离线",
+        "btn_sit_out": "暂离",
+        "btn_sit_back": "回来",
+        "status_away": "你已暂离，点击「回来」继续",
     },
     "en": {
         "window_title": "Texas Hold'em",
@@ -167,6 +172,11 @@ TEXTS: dict[str, dict[str, str]] = {
         "error_bad_password": "Wrong room password",
         "error_nickname_taken": "Someone here already uses that nickname",
         "error_version_mismatch": "This client and the server are different versions",
+        "error_replaced": "You joined this room again from somewhere else",
+        "seat_offline": "Offline",
+        "btn_sit_out": "Sit out",
+        "btn_sit_back": "I'm back",
+        "status_away": "You are sitting out; click I'm back to play",
     },
 }
 

@@ -4,6 +4,9 @@ Everything is drawn on one Canvas. Server messages arrive on the network thread'
 are polled with ``after``. Events become animation steps; while they play, the action buttons
 stay locked and the drawn view (``self.view``) lags the server's ``table_state``
 (``self.state``), which replaces it once the queue drains.
+
+If the connection drops at the table, the client reconnects with the token from ``welcome`` and
+the server answers with a fresh ``table_state``.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import base64
 import copy
 from collections import deque
 import queue
+import time
 import tkinter as tk
 from tkinter import simpledialog
 from typing import Callable
@@ -60,7 +64,10 @@ from holdem.core.table import TableConfig
 from holdem.i18n import translate
 
 POLL_MS = 30
+TIMER_MS = 100
 ERROR_MS = 4000
+RECONNECT_MS = 2000
+RECONNECT_ATTEMPTS = 30
 CARD_W, CARD_H = 96, 134
 SMALL_W, SMALL_H = 60, 84
 BOARD_Y = 296
@@ -105,6 +112,15 @@ class HoldemApp(tk.Tk):
         self.network: NetworkClient | None = None
         self.server: EmbeddedServer | None = None
         self.connecting = False
+        self.reconnecting = False
+        self.reconnect_attempts = 0
+        self._session = 0  # bumped whenever a room is entered or left, so stale reconnects give up
+        self.url = ""
+        self.nickname = ""
+        self.password: str | None = None
+        self.token: str | None = None
+        self.clock: Callable[[], float] = time.monotonic
+        self.deadline: float | None = None  # when the seat to act runs out of time, on self.clock
         self.lobby_status: tuple[str, dict, bool] | None = None
         self.room_address = ""
         self.config_info: protocol.Message | None = None
@@ -136,6 +152,7 @@ class HoldemApp(tk.Tk):
         self._show_lobby()
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.after(POLL_MS, self._poll)
+        self.after(TIMER_MS, self._tick_timer)
 
     def t(self, key: str, **values: object) -> str:
         return translate(self.language, key, **values)
@@ -342,11 +359,37 @@ class HoldemApp(tk.Tk):
 
     def _connect(self, url: str, nickname: str, password: str | None) -> None:
         self.connecting = True
+        self._session += 1
+        self.url, self.nickname, self.password, self.token = url, nickname, password, None
         self.network = self.network_factory()
         self.network.connect(url, protocol.hello(nickname, password))
         self._set_lobby_status("status_connecting", is_error=False)
 
+    def _connection_lost(self) -> None:
+        """At the table, keep trying to get back in with our token; give up after a while."""
+        self.network = None
+        self.turn = None
+        if self.reconnect_attempts >= RECONNECT_ATTEMPTS:
+            self._leave_room(("error_disconnected", {}, True))
+            return
+        self.reconnecting = True
+        self.reconnect_attempts += 1
+        session = self._session
+        self._schedule(RECONNECT_MS, lambda: self._reconnect(session))
+        self._render()
+        self._update_controls()
+
+    def _reconnect(self, session: int) -> None:
+        if session != self._session or not self.reconnecting:
+            return
+        self.network = self.network_factory()
+        self.network.connect(self.url, protocol.hello(self.nickname, self.password, self.token))
+
     def _leave_room(self, status: tuple[str, dict, bool] | None) -> None:
+        self._session += 1
+        self.reconnecting = False
+        self.reconnect_attempts = 0
+        self.deadline = None
         if self.network is not None:
             self.network.close()
             self.network = None
@@ -386,12 +429,16 @@ class HoldemApp(tk.Tk):
 
     def handle_message(self, message: protocol.Message) -> None:
         kind = message["type"]
-        if kind == "_connect_failed":
+        if kind in ("_connect_failed", "_disconnected") and self.screen == "table":
+            self._connection_lost()
+        elif kind == "_connect_failed":
             self._leave_room(("error_connect_failed", {"reason": message["reason"]}, True))
         elif kind == "_disconnected":
             self._leave_room(("error_disconnected", {}, True))
         elif kind == "error":
-            if self.screen == "lobby":
+            if message["code"] == "replaced":
+                self._leave_room(("error_replaced", {}, True))
+            elif self.screen == "lobby" or self.reconnecting:
                 # The server refused the hello and is about to hang up.
                 key = JOIN_ERRORS.get(message["code"])
                 status = (key, {}, True) if key else ("error_connect_failed", {"reason": message["message"]}, True)
@@ -400,9 +447,19 @@ class HoldemApp(tk.Tk):
                 self._show_error(message["message"])
         elif kind == "welcome":
             self.config_info = message["config"]
-            self._show_table()
+            self.token = message["token"]
+            if self.screen == "table":
+                # Back in after a dropped connection; the table_state that follows brings us up to date.
+                self.reconnecting = False
+                self.reconnect_attempts = 0
+                self.labels.clear()
+            else:
+                self._show_table()
         elif kind == "table_state":
             self.state = message
+            hand = message["hand"]
+            time_left = hand["time_left"] if hand else None
+            self.deadline = self.clock() + time_left if time_left is not None else None
             if not self.animating:
                 self._sync_view()
                 self._render()
@@ -442,6 +499,7 @@ class HoldemApp(tk.Tk):
         self.rebuy_button = CanvasButton(canvas, (836, 28), (120, 32), self.rebuy, "ghost", tags)
         self.leave_button = CanvasButton(canvas, (950, 28), (90, 32), self.leave_seat, "ghost", tags)
         self.exit_button = CanvasButton(canvas, (1046, 28), (90, 32), self.exit_room, "ghost", tags)
+        self.away_button = CanvasButton(canvas, (492, CONTROL_Y), (100, 40), self.toggle_away, "ghost", tags)
         self.fold_button = CanvasButton(canvas, (612, CONTROL_Y), (104, 46), self.fold, "secondary", tags)
         self.call_button = CanvasButton(canvas, (737, CONTROL_Y), (132, 46), self.check_or_call, "secondary", tags)
         self.raise_button = CanvasButton(canvas, (884, CONTROL_Y), (150, 46), self.bet_or_raise, "primary", tags)
@@ -477,7 +535,7 @@ class HoldemApp(tk.Tk):
         return self.state["seats"][self.state["your_seat"]]
 
     def _active_turn(self) -> protocol.Message | None:
-        if self.turn is None or self.animating or self.state is None:
+        if self.turn is None or self.animating or self.state is None or self.reconnecting:
             return None
         hand = self.state["hand"]
         if hand is None or hand["to_act"] != self.turn["seat"] or self.state["your_seat"] != self.turn["seat"]:
@@ -519,8 +577,12 @@ class HoldemApp(tk.Tk):
         seat = self._my_seat()
         in_hand = seat is not None and seat["in_hand"]
         max_buy_in = self.config_info["max_buy_in"] if self.config_info else 0
-        self.rebuy_button.set_enabled(seat is not None and not in_hand and seat["stack"] < max_buy_in)
-        self.leave_button.set_enabled(seat is not None)
+        online = not self.reconnecting
+        self.rebuy_button.set_enabled(online and seat is not None and not in_hand and seat["stack"] < max_buy_in)
+        self.leave_button.set_enabled(online and seat is not None)
+        away = seat is not None and seat["away"]
+        self.away_button.set_text(self.t("btn_sit_back" if away else "btn_sit_out"), self._font(14, "bold"))
+        self.away_button.set_enabled(online and seat is not None)
 
     # Table actions
 
@@ -585,6 +647,11 @@ class HoldemApp(tk.Tk):
     def leave_seat(self) -> None:
         if self._my_seat() is not None:
             self._send(protocol.leave())
+
+    def toggle_away(self) -> None:
+        seat = self._my_seat()
+        if seat is not None:
+            self._send(protocol.away(not seat["away"]))
 
     # Events and animation
 
@@ -888,7 +955,39 @@ class HoldemApp(tk.Tk):
                 self._draw_seat(index, seat, positions[index])
         self._draw_balance()
         self._draw_status()
+        self._draw_timer()
         canvas.tag_raise("sprite")
+
+    def _timer_seat(self) -> int | None:
+        """The seat whose action timer is shown: the one to act, once the animations have caught up."""
+        if self.screen != "table" or self.animating or self.deadline is None or self.state is None:
+            return None
+        hand = self.state["hand"]
+        if hand is None or hand["complete"] or hand["to_act"] is None or self.view is None:
+            return None
+        return hand["to_act"] if self.view["seats"][hand["to_act"]] is not None else None
+
+    def _draw_timer(self) -> None:
+        self.canvas.delete("timer")
+        index = self._timer_seat()
+        if index is None or self.config_info is None:
+            return
+        fraction = min(max((self.deadline - self.clock()) / self.config_info["action_timeout"], 0.0), 1.0)
+        x, y = self._positions()[index]
+        tags = ("dyn", "timer")
+        self.canvas.create_rectangle(x - 58, y + 33, x + 58, y + 36, fill=RAIL_DARK, outline="", tags=tags)
+        if fraction > 0:
+            self.canvas.create_rectangle(
+                x - 58, y + 33, x - 58 + 116 * fraction, y + 36, fill=lerp_color(LOSE, GOLD, fraction), outline="",
+                tags=tags,
+            )
+
+    def _tick_timer(self) -> None:
+        try:
+            self._draw_timer()
+            self.canvas.tag_raise("sprite")
+        finally:
+            self.after(TIMER_MS, self._tick_timer)
 
     def _draw_room_info(self) -> None:
         if self.config_info is None:
@@ -949,12 +1048,14 @@ class HoldemApp(tk.Tk):
                 for cx, cy in self._hole_points(index):
                     self._draw_card(cx, cy, None, small=True)
 
-        dim = seat["folded"] or seat["away"]
+        offline = not seat["connected"]
+        dim = seat["folded"] or seat["away"] or offline
         create_rounded_rect(
             canvas, x - 66, y - 11, x + 66, y + 39, 10, fill=PANEL,
             outline=GOLD if to_act else (GOLD if mine else GOLD_DARK), width=3 if to_act else 1, tags=("dyn",),
         )
-        name = seat["name"] + (f" ({self.t('seat_away')})" if seat["away"] else "")
+        note = "seat_offline" if offline else "seat_away" if seat["away"] else None
+        name = seat["name"] + (f" ({self.t(note)})" if note else "")
         canvas.create_text(x, y + 3, text=name, font=self._font(14, "bold"), fill=MUTED if dim else CREAM, tags="dyn")
         canvas.create_text(
             x, y + 24, text=str(seat["stack"]), font=(NUMBER_FONT, -15, "bold"), fill=MUTED if dim else GOLD, tags="dyn"
@@ -987,6 +1088,8 @@ class HoldemApp(tk.Tk):
         canvas.create_text(84, CONTROL_Y + 11, text=str(seat["stack"]), anchor="w", font=(NUMBER_FONT, -24, "bold"), fill=CREAM, tags="dyn")
 
     def _status(self) -> tuple[str, str]:
+        if self.reconnecting:
+            return self.t("status_reconnecting"), ERROR
         if self.status_error:
             return self.status_error, ERROR
         state = self.state
@@ -1004,6 +1107,8 @@ class HoldemApp(tk.Tk):
                 return self.t("status_waiting_for", name=state["seats"][hand["to_act"]]["name"]), CREAM
         if seat["stack"] == 0:
             return self.t("status_sitting_out"), CREAM
+        if seat["away"]:
+            return self.t("status_away"), GOLD
         ready = sum(1 for other in state["seats"] if other is not None and other["stack"] > 0 and not other["away"])
         if ready < 2:
             return self.t("status_waiting"), CREAM
@@ -1013,7 +1118,7 @@ class HoldemApp(tk.Tk):
         text, color = self._status()
         if text:
             self.canvas.create_text(
-                212, CONTROL_Y, text=text, anchor="w", width=330, font=self._font(15, "bold"), fill=color,
+                212, CONTROL_Y, text=text, anchor="w", width=220, font=self._font(15, "bold"), fill=color,
                 tags=("dyn", "status"),
             )
 

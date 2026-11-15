@@ -31,10 +31,10 @@ def seeded_decks():
 async def server():
     servers = []
 
-    async def start(**options):
+    async def start(config=CONFIG, **options):
         options.setdefault("hand_delay", 0)
         options.setdefault("deck_factory", seeded_decks())
-        ws_server, room = await start_server(CONFIG, host="127.0.0.1", port=0, **options)
+        ws_server, room = await start_server(config, host="127.0.0.1", port=0, **options)
         servers.append(ws_server)
         port = ws_server.sockets[0].getsockname()[1]
         return f"ws://127.0.0.1:{port}", room
@@ -64,9 +64,9 @@ def of_type(kind):
     return lambda message: message["type"] == kind
 
 
-async def joined(url, name, password=None):
+async def joined(url, name, password=None, token=None):
     ws = await connect(url)
-    await send(ws, protocol.hello(name, password))
+    await send(ws, protocol.hello(name, password, token))
     welcome, _ = await recv_until(ws, of_type("welcome"))
     await recv_until(ws, of_type("table_state"))
     return ws, welcome
@@ -154,18 +154,59 @@ async def test_two_clients_play_a_hand_and_see_only_their_own_cards(server):
         assert error["code"] == "illegal_action"
 
 
-async def test_disconnect_folds_and_frees_the_seat(server):
+async def test_reconnecting_with_the_token_resumes_the_seat_and_the_turn(server):
     url, room = await server()
-    alice, _ = await joined(url, "alice")
+    alice, welcome = await joined(url, "alice")
     bob, _ = await joined(url, "bob")
     async with bob:
         await send(alice, protocol.sit(0, 100))
         await send(bob, protocol.sit(1, 100))
         await recv_until(alice, of_type("your_turn"))
         await alice.close()
+        await recv_until(bob, lambda m: m["type"] == "table_state" and not m["seats"][0]["connected"])
 
-        state, _ = await recv_until(bob, lambda m: m["type"] == "table_state" and m["seats"][0] is None)
+        again, rewelcome = await joined(url, "alice", token=welcome["token"])
+        async with again:
+            turn, _ = await recv_until(again, of_type("your_turn"))
+            await send(again, protocol.action("call"))
+            action, _ = await recv_until(bob, lambda m: m["type"] == "event" and m["event"]["type"] == "action")
 
+    assert rewelcome["player_id"] == welcome["player_id"]
+    assert turn["seat"] == 0 and 0 < turn["time_left"] <= CONFIG.action_timeout
+    assert (action["event"]["seat"], action["event"]["action"]) == (0, "call")
+
+
+async def test_joining_again_with_the_token_hangs_up_the_old_connection(server):
+    url, room = await server()
+    old, welcome = await joined(url, "alice")
+    async with old:
+        new, _ = await joined(url, "alice", token=welcome["token"])
+        async with new:
+            error, _ = await recv_until(old, of_type("error"))
+            with pytest.raises(ConnectionClosed):
+                await recv_until(old, lambda message: False)
+            await send(new, protocol.sit(0, 100))
+            state, _ = await recv_until(new, of_type("table_state"))
+
+    assert error["code"] == "replaced"
+    assert old.close_reason == "replaced"
+    assert state["your_seat"] == 0
+
+
+async def test_the_server_acts_for_a_player_who_runs_out_of_time(server):
+    config = TableConfig(small_blind=1, big_blind=2, min_buy_in=40, max_buy_in=200, max_seats=6, action_timeout=0.2)
+    url, room = await server(config)
+    alice, _ = await joined(url, "alice")
+    bob, _ = await joined(url, "bob")
+    async with alice, bob:
+        await send(alice, protocol.sit(0, 100))
+        await send(bob, protocol.sit(1, 100))
+        await recv_until(alice, of_type("your_turn"))
+
+        fold, _ = await recv_until(bob, lambda m: m["type"] == "event" and m["event"]["type"] == "action")
+        state, _ = await recv_until(bob, lambda m: m["type"] == "table_state" and m["seats"][0]["away"])
+
+    assert (fold["event"]["seat"], fold["event"]["action"]) == (0, "fold")
     assert state["seats"][1]["stack"] == 101
 
 
@@ -201,7 +242,13 @@ def test_command_line_defaults_and_validation():
     args = parse_args(["--blinds", "5/10", "--password", "pw", "--bots", "2"])
     assert (args.config.min_buy_in, args.config.max_buy_in) == (200, 1000)
     assert (args.host, args.port, args.password, args.bots) == ("0.0.0.0", 8765, "pw", 2)
+    assert (args.config.action_timeout, args.reconnect_grace) == (30.0, 120.0)
+    args = parse_args(["--action-timeout", "15", "--reconnect-grace", "0"])
+    assert (args.config.action_timeout, args.reconnect_grace) == (15.0, 0.0)
 
-    for argv in (["--blinds", "10/5"], ["--blinds", "x"], ["--seats", "12"], ["--bots", "10"]):
+    for argv in (
+        ["--blinds", "10/5"], ["--blinds", "x"], ["--seats", "12"], ["--bots", "10"],
+        ["--action-timeout", "0"], ["--reconnect-grace", "-1"],
+    ):
         with pytest.raises(SystemExit):
             parse_args(argv)

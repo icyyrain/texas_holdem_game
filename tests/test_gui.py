@@ -112,12 +112,12 @@ def texts(app, tag="dyn"):
 
 def seat(index, name, stack=100, **flags):
     entry = {"seat": index, "player_id": name, "name": name, "stack": stack, "away": False, "leaving": False,
-             "in_hand": False, "folded": False, "all_in": False, "bet": 0, "cards": None}
+             "connected": True, "in_hand": False, "folded": False, "all_in": False, "bet": 0, "cards": None}
     return {**entry, **flags}
 
 
 def hand(**overrides):
-    view = {"number": 1, "street": "preflop", "board": [], "pots": [], "current_bet": 2, "to_act": 0,
+    view = {"number": 1, "street": "preflop", "board": [], "pots": [], "current_bet": 2, "to_act": 0, "time_left": 30,
             "button": 0, "small_blind": 0, "big_blind": 1, "complete": False}
     return {**view, **overrides}
 
@@ -474,13 +474,99 @@ def test_exiting_a_hosted_room_stops_its_server(app, scheduler):
     assert FakeServer.instances[-1].stopped
 
 
-def test_losing_the_connection_returns_to_the_lobby(app, scheduler):
-    enter_table(app, state(0, [seat(0, "alice")]))
+def test_losing_the_connection_reconnects_with_the_token(app, scheduler):
+    enter_table(app, heads_up_preflop())
+    app.handle_message(protocol.your_turn(1, 0, LEGAL))
+    scheduler.run_until_idle()
 
     app.handle_message({"type": "_disconnected"})
 
+    assert app.screen == "table"
+    assert texts(app, "status") == ["连接断开，正在重连…"]
+    assert not app.call_button.enabled and not app.leave_button.enabled
+    scheduler.run_until_idle()
+    assert app.network.connected == ("ws://127.0.0.1:8765", protocol.hello("alice", None, "tok"))
+
+    app.handle_message(protocol.welcome("alice", "tok", CONFIG))
+    app.handle_message(heads_up_preflop())
+    app.handle_message(protocol.your_turn(1, 0, LEGAL, time_left=12))
+
+    assert not app.reconnecting
+    assert app.call_button.enabled
+    assert "轮到你了" in texts(app, "status")
+
+
+def test_reconnecting_gives_up_after_many_failures(app, scheduler):
+    enter_table(app, state(0, [seat(0, "alice")]))
+
+    app.handle_message({"type": "_disconnected"})
+    for _ in range(30):
+        scheduler.run_until_idle()
+        app.handle_message({"type": "_connect_failed", "reason": "refused"})
+
     assert app.screen == "lobby"
     assert lobby_status(app) == ["与服务器的连接断开了"]
+
+
+def test_a_refused_rejoin_returns_to_the_lobby(app, scheduler):
+    enter_table(app, state(0, [seat(0, "alice")]))
+    app.handle_message({"type": "_disconnected"})
+    scheduler.run_until_idle()
+
+    app.handle_message(protocol.error("nickname_taken", "taken"))
+
+    assert app.screen == "lobby"
+    assert lobby_status(app) == ["这个昵称已经有人用了"]
+
+
+def test_being_replaced_by_another_connection_returns_to_the_lobby(app, scheduler):
+    enter_table(app, state(0, [seat(0, "alice")]))
+
+    app.handle_message(protocol.error("replaced", "you joined again"))
+
+    assert app.screen == "lobby"
+    assert lobby_status(app) == ["你在别处重新进入了这个房间"]
+
+
+def test_sit_out_and_come_back(app, scheduler):
+    network = enter_table(app, state(0, [seat(0, "alice"), seat(1, "bob")]))
+    assert app.away_button.text == "暂离"
+
+    app.toggle_away()
+    app.handle_message(state(0, [seat(0, "alice", away=True), seat(1, "bob")]))
+
+    assert app.away_button.text == "回来"
+    assert texts(app, "status") == ["你已暂离，点击「回来」继续"]
+    assert "alice (暂离)" in texts(app)
+    app.toggle_away()
+    assert network.sent == [protocol.away(True), protocol.away(False)]
+
+
+def test_offline_players_are_marked(app, scheduler):
+    enter_table(app, state(0, [seat(0, "alice"), seat(1, "bob", connected=False, away=True)]))
+
+    assert "bob (离线)" in texts(app)
+
+
+def test_the_action_timer_shrinks_under_the_seat_to_act(app, scheduler, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(app, "clock", lambda: now[0])
+    seats = [seat(0, "alice", in_hand=True), seat(1, "bob", in_hand=True)]
+    enter_table(app, state(0, seats, hand(to_act=1, time_left=15)))
+
+    now[0] = 107.5
+    app._draw_timer()
+
+    bars = [app.canvas.coords(item) for item in app.canvas.find_withtag("timer")]
+    assert len(bars) == 2
+    full, left = bars
+    assert full[2] - full[0] == 116
+    assert left[2] - left[0] == pytest.approx(116 * 7.5 / 30)
+    x, _ = seat_positions(6, 0)[1]
+    assert full[0] == x - 58
+
+    app.handle_message(state(0, seats, hand(to_act=1, time_left=None, complete=True)))
+    assert not app.canvas.find_withtag("timer")
 
 
 def test_language_toggle_relabels_the_table(app, scheduler):
