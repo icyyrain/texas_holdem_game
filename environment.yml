@@ -1,0 +1,14 @@
+name: holdem-game
+channels:
+  - conda-forge
+dependencies:
+  - cairosvg
+  - pillow
+  - python>=3.11
+  - pyinstaller
+  - pytest>=8
+  - pytest-asyncio
+  - websockets
+  - pip
+  - pip:
+      - -e .
