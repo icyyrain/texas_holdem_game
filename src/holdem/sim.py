@@ -12,6 +12,7 @@ import re
 import sys
 from typing import Callable, Iterable, Mapping
 
+from holdem.bots import random_action
 from holdem.core.betting import Action, LegalActions
 from holdem.core.cards import Card, Deck
 from holdem.core.table import Event, HandState, Table, TableConfig
@@ -37,10 +38,6 @@ ALIASES = {
     "all_in": ALL_IN,
 }
 QUIT_WORDS = {"q", "quit", "exit"}
-
-# Random bots: never fold when checking is free, and rarely shove.
-BOT_WEIGHTS = {FOLD: 1, CHECK: 3, CALL: 3, BET: 2, RAISE: 1, ALL_IN: 0.2}
-
 
 class Quit(Exception):
     pass
@@ -95,6 +92,8 @@ def describe_event(event: Event, names: Mapping[int, str]) -> str | None:
     if kind == "blind":
         return f"{name} posts {event['blind']} blind {event['amount']}{all_in}"
     if kind == "hole_cards":
+        if "cards" not in event:
+            return f"{name} is dealt two cards"
         return f"{name} is dealt {cards_text(event['cards'])}"
     if kind == "action":
         action = event["action"]
@@ -140,15 +139,6 @@ def format_table(hand: HandState, names: Mapping[int, str]) -> str:
             f"  {cards_text(player.hole)}  {status}".rstrip()
         )
     return "\n".join(lines)
-
-
-def bot_action(legal: LegalActions, rng: random.Random) -> tuple[Action, int | None]:
-    choices = sorted(action for action in legal.actions if not (action is FOLD and CHECK in legal.actions))
-    action = rng.choices(choices, weights=[BOT_WEIGHTS[action] for action in choices])[0]
-    if action in (BET, RAISE):
-        low, high = legal.min_raise_to, legal.max_raise_to
-        return action, rng.randint(low, min(high, low * 3))
-    return action, None
 
 
 def ask_action(
@@ -244,7 +234,7 @@ def run(
                 seat = hand.to_act
                 legal = hand.legal_actions(seat)
                 if seat in args.bot_seats:
-                    action, amount = bot_action(legal, rng)
+                    action, amount = random_action(legal, rng)
                 else:
                     out(format_table(hand, names))
                     action, amount = ask_action(names[seat], legal, input_fn, out)

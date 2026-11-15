@@ -64,6 +64,8 @@ NAMES = {0: "P1", 1: "P2", 2: "P3"}
         ({"type": "blind", "seat": 1, "blind": "small", "amount": 1, "all_in": False}, "P2 posts small blind 1"),
         ({"type": "blind", "seat": 2, "blind": "big", "amount": 1, "all_in": True}, "P3 posts big blind 1 (all-in)"),
         ({"type": "hole_cards", "seat": 0, "cards": ["AS", "TD"]}, "P1 is dealt [A♠] [10♦]"),
+        ({"type": "hole_cards", "seat": 1}, "P2 is dealt two cards"),
+        ({"type": "burn"}, None),
         ({"type": "action", "seat": 0, "action": "fold", "amount": 0, "to": 0, "all_in": False}, "P1 folds"),
         ({"type": "action", "seat": 0, "action": "check", "amount": 0, "to": 2, "all_in": False}, "P1 checks"),
         ({"type": "action", "seat": 0, "action": "call", "amount": 2, "to": 2, "all_in": False}, "P1 calls 2"),
