@@ -108,6 +108,7 @@ class HandState:
 
         self.street = Street.PREFLOP
         self.board: list[Card] = []
+        self.burned: list[Card] = []
         self.current_bet = 0
         self.min_raise = config.big_blind
         self.to_act: int | None = None
@@ -298,6 +299,9 @@ class HandState:
 
     def _deal_street(self, street: Street) -> None:
         self.street = street
+        # One card goes face down before each street; nobody ever sees it.
+        self.burned.append(self.deck.deal())
+        self._log("burn")
         cards = [self.deck.deal() for _ in range(_BOARD_CARDS[street])]
         self.board.extend(cards)
         self._log("street", street=street.value, cards=[card.code for card in cards])

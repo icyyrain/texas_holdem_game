@@ -16,11 +16,18 @@ def table_with(stacks):
 
 
 def rigged_deck(deal_order, holes, board=""):
-    """A deck dealing ``holes[seat]`` one card per round in ``deal_order``, then ``board``."""
+    """A deck dealing ``holes[seat]`` one card per round in ``deal_order``, then ``board``.
+
+    Spare cards fill the burn before each street.
+    """
     split = {seat: [Card.from_code(code) for code in holes[seat].split()] for seat in deal_order}
     sequence = [split[seat][0] for seat in deal_order] + [split[seat][1] for seat in deal_order]
-    sequence += [Card.from_code(code) for code in board.split()]
-    rest = [card for card in Deck.standard().cards if card not in sequence]
+    board_cards = [Card.from_code(code) for code in board.split()]
+    spare = [card for card in Deck.standard().cards if card not in sequence and card not in board_cards]
+    burns, rest = spare[:3], spare[3:]
+    for burn, street in zip(burns, (board_cards[:3], board_cards[3:4], board_cards[4:])):
+        if street:
+            sequence += [burn, *street]
     return Deck(rest + sequence[::-1])
 
 
@@ -228,6 +235,22 @@ def test_all_in_and_call_runs_out_the_board():
     assert len(hand.board) == 5
     assert [event["street"] for event in events(hand, "street")] == ["flop", "turn", "river"]
     assert len(events(hand, "showdown")) == 2
+
+
+def test_one_card_is_burned_before_each_street():
+    holes = {0: "AS AD", 1: "KS KD", 2: "7C 2D"}
+    _, hand = start([100, 100, 100], holes, board="AH 9C 5S 3D JH")
+
+    act(hand, (0, ALL_IN), (1, CALL), (2, CALL))
+
+    assert [card.code for card in hand.board] == ["AH", "9C", "5S", "3D", "JH"]
+    assert len(hand.burned) == 3
+    dealt = {card for player in hand.players.values() for card in player.hole} | set(hand.board)
+    assert not dealt & set(hand.burned)
+    assert len(hand.deck) == 52 - 6 - 3 - 5
+    kinds = [event["type"] for event in hand.events if event["type"] in ("burn", "street")]
+    assert kinds == ["burn", "street"] * 3
+    assert all(event == {"type": "burn"} for event in events(hand, "burn"))
 
 
 def test_short_all_in_big_blind_needs_no_action():
