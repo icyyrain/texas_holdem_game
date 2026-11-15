@@ -2,7 +2,7 @@
 
 A multiplayer No-Limit Texas Hold'em game for play chips only. Players connect a tkinter desktop client to a websocket server, which runs either inside a player's client ("Create Room") or headless on a VPS. See the [design spec](docs/specs/2026-11-15-texas-holdem-design.md).
 
-Work in progress: the game rules, the WebSocket server (with random bots, action timers and reconnecting), the desktop client and a minimal text client work; deployment docs and packaging are not done yet.
+Version 1 is complete: the game rules, the WebSocket server (with random bots, action timers and reconnecting), the desktop client (also as a Windows exe) and a minimal text client. Smarter bots are the next idea.
 
 ![Table screenshot](assets/table.png)
 
@@ -37,6 +37,8 @@ conda run -n holdem-game python -m holdem.client
 - **Create Room** starts a server inside the client and shows your LAN IP in the top bar for others to join. You can add bots.
 - **Join Room** connects to someone else's room or a VPS server.
 
+The first time you create a room, Windows Firewall asks whether to let the game on the network; allow it on private networks or other players cannot connect.
+
 Click an empty seat to sit down. On your turn, use Fold, Check/Call, and Bet/Raise with the slider or the 1/2 pot, 3/4 pot, Pot and All-in presets. A bar under the player to act shows the time left; when it runs out the server checks or folds for them and sits them out. **Sit out** skips the next hands until you click **I'm back**. If the connection drops, the client reconnects to the same seat on its own. Players on other networks need port forwarding or a virtual LAN such as Tailscale or ZeroTier.
 
 ## Server
@@ -45,7 +47,17 @@ Click an empty seat to sit down. On your turn, use Fold, Check/Call, and Bet/Rai
 conda run -n holdem-game python -m holdem.server --host 0.0.0.0 --port 8765 --password secret
 ```
 
-Options: `--blinds 1/2`, `--min-buy-in` / `--max-buy-in` (default 20 / 100 big blinds), `--seats 9`, `--bots 2` (random bots that sit at the table), `--hand-delay 3`, `--bot-think 1`, `--action-timeout 30` (seconds per decision), `--reconnect-grace 120` (seconds a disconnected player keeps their seat).
+Options: `--blinds 1/2`, `--min-buy-in` / `--max-buy-in` (default 20 / 100 big blinds), `--seats 9`, `--bots 2` (random bots that sit at the table), `--hand-delay 3`, `--bot-think 1`, `--action-timeout 30` (seconds per decision), `--reconnect-grace 120` (seconds a disconnected player keeps their seat). The password can also come from the `HOLDEM_PASSWORD` environment variable.
+
+To run a table on a Linux VPS as a systemd service, with `wss://` through Caddy or nginx, see [docs/deploy.md](docs/deploy.md).
+
+## Windows exe
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_exe.ps1
+```
+
+This writes `dist\Holdem.exe` (about 15 MB), a single file with the card images inside. It can create rooms as well as join them, so players need nothing else. Build it from the same commit as any server it will join.
 
 ## Text client
 

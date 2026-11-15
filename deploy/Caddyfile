@@ -1,0 +1,5 @@
+# Caddy gets a certificate for the name automatically and proxies WebSockets as they are.
+# Clients join with  wss://poker.example.com
+poker.example.com {
+	reverse_proxy 127.0.0.1:8765
+}

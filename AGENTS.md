@@ -8,7 +8,8 @@ Design spec: `docs/specs/2026-11-15-texas-holdem-design.md`.
 - Desktop client: `conda run -n holdem-game python -m holdem.client`
 - Server: `conda run -n holdem-game python -m holdem.server --port 8765 --bots 2`; text client: `python -m holdem.textclient --name alice` (seats are 1-based in the text client, 0-based in the protocol).
 - Rules simulator: `conda run -n holdem-game python -m holdem.sim --players 3` (hot-seat, all cards shown; `--bots 1,2,3 --hands 20 --seed 7` runs unattended). `conda run` pipes output through the console code page, so card suits can show as mojibake; run the env's `python.exe` directly to see them.
-- Windows exe: `powershell -ExecutionPolicy Bypass -File .\scripts\build_exe.ps1` (writes `dist\Holdem.exe`; not tried yet, packaging is milestone 8)
+- Windows exe: `powershell -ExecutionPolicy Bypass -File .\scripts\build_exe.ps1` writes a one-file `dist\Holdem.exe` with `assets/cards` and `assets/cards_small` bundled (`card_images.resource_root` reads them from `sys._MEIPASS`). The committed PNGs are used as they are; the script renders them only if a folder is incomplete, because re-rendering produces tiny antialiasing differences that show up as changed files.
+- VPS deployment: `docs/deploy.md` with `deploy/holdem.service` (systemd), `deploy/holdem.env.example`, `deploy/Caddyfile` and `deploy/nginx.conf`. The server reads `HOLDEM_PASSWORD` when `--password` is not given and does not import tkinter.
 - `scripts/prepare_card_images.py` needs cairo DLLs from the conda env, so run it through `conda run` (activation puts `Library\bin` on PATH).
 
 ## Architecture

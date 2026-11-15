@@ -1,0 +1,36 @@
+# systemd unit for a headless table. See docs/deploy.md.
+#   sudo cp deploy/holdem.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now holdem
+
+[Unit]
+Description=Texas Hold'em table
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=holdem
+Group=holdem
+# HOLDEM_PASSWORD (the room password) and HOLDEM_ARGS (extra options) live here.
+EnvironmentFile=-/etc/holdem/holdem.env
+# 127.0.0.1 behind Caddy or nginx; use --host 0.0.0.0 to accept plain ws:// connections directly.
+ExecStart=/opt/holdem/venv/bin/python -m holdem.server --host 127.0.0.1 --port 8765 $HOLDEM_ARGS
+Restart=on-failure
+RestartSec=3
+
+# The server needs nothing but the network.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

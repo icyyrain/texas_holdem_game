@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 
 from holdem import protocol
 from holdem.core.table import TableConfig
@@ -17,7 +18,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python -m holdem.server", description="Run a No-Limit Hold'em table.")
     parser.add_argument("--host", default="0.0.0.0", help="address to listen on (default 0.0.0.0)")
     parser.add_argument("--port", type=int, default=protocol.DEFAULT_PORT, help=f"default {protocol.DEFAULT_PORT}")
-    parser.add_argument("--password", help="room password (default: none)")
+    parser.add_argument(
+        "--password", default=os.environ.get("HOLDEM_PASSWORD") or None,
+        help="room password (default: the HOLDEM_PASSWORD environment variable, else none)",
+    )
     parser.add_argument("--blinds", default="1/2", help="small/big (default 1/2)")
     parser.add_argument("--min-buy-in", type=int, help="default 20 big blinds")
     parser.add_argument("--max-buy-in", type=int, help="default 100 big blinds")
@@ -63,9 +67,9 @@ async def serve_forever(args: argparse.Namespace) -> None:
     )
     config = args.config
     log.info(
-        "listening on %s:%d · blinds %d/%d · buy-in %d-%d · %d seats · %gs to act%s",
+        "listening on %s:%d, blinds %d/%d, buy-in %d-%d, %d seats, %gs to act%s",
         args.host, args.port, config.small_blind, config.big_blind, config.min_buy_in, config.max_buy_in,
-        config.max_seats, config.action_timeout, " · password set" if args.password else "",
+        config.max_seats, config.action_timeout, ", password set" if args.password else "",
     )
     await server.serve_forever()
 

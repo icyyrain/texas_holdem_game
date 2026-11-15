@@ -238,7 +238,16 @@ async def test_connection_drops_a_client_that_stops_reading(monkeypatch):
     assert closed == [1008]
 
 
-def test_command_line_defaults_and_validation():
+def test_password_can_come_from_the_environment(monkeypatch):
+    monkeypatch.setenv("HOLDEM_PASSWORD", "from-env")
+    assert parse_args([]).password == "from-env"
+    assert parse_args(["--password", "flag"]).password == "flag"
+    monkeypatch.setenv("HOLDEM_PASSWORD", "")
+    assert parse_args([]).password is None
+
+
+def test_command_line_defaults_and_validation(monkeypatch):
+    monkeypatch.delenv("HOLDEM_PASSWORD", raising=False)
     args = parse_args(["--blinds", "5/10", "--password", "pw", "--bots", "2"])
     assert (args.config.min_buy_in, args.config.max_buy_in) == (200, 1000)
     assert (args.host, args.port, args.password, args.bots) == ("0.0.0.0", 8765, "pw", 2)

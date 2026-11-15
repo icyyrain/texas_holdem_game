@@ -59,13 +59,23 @@ if ($RunningExe) {
     throw "Close dist\Holdem.exe before building. It is currently running and Windows will not let PyInstaller replace it."
 }
 
-& $CondaExe run -n $EnvName python scripts\prepare_card_images.py
-if ($LASTEXITCODE -ne 0) {
-    throw "Card image preparation failed with exit code $LASTEXITCODE."
+# The PNGs are committed; render them only if a folder is incomplete (52 faces + back.png).
+function Test-CardImages {
+    param([string]$Folder)
+    return (Test-Path -LiteralPath $Folder) -and @(Get-ChildItem -LiteralPath $Folder -Filter *.png).Count -ge 53
 }
-& $CondaExe run -n $EnvName python scripts\prepare_card_images.py --output-dir assets\cards_small --width 60 --height 84
-if ($LASTEXITCODE -ne 0) {
-    throw "Small card image preparation failed with exit code $LASTEXITCODE."
+
+if (-not (Test-CardImages $CardAssetsPath)) {
+    & $CondaExe run -n $EnvName python scripts\prepare_card_images.py
+    if ($LASTEXITCODE -ne 0) {
+        throw "Card image preparation failed with exit code $LASTEXITCODE."
+    }
+}
+if (-not (Test-CardImages $SmallCardAssetsPath)) {
+    & $CondaExe run -n $EnvName python scripts\prepare_card_images.py --output-dir assets\cards_small --width 60 --height 84
+    if ($LASTEXITCODE -ne 0) {
+        throw "Small card image preparation failed with exit code $LASTEXITCODE."
+    }
 }
 
 & $CondaExe run -n $EnvName python -m PyInstaller `
