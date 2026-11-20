@@ -81,6 +81,7 @@ HOLE_OFFSETS = ((-17, -26), (17, -26))
 BET_FRACTION = 0.42
 NUMBER_FONT = "Segoe UI"
 FLIP_SCALES = (0.8, 0.6, 0.4, 0.2)
+FOLDED_SHADE = 0.6  # folded hole cards are drawn in greyscale at this brightness
 ERROR = "#ff8a7a"
 PRESETS = (
     ("btn_quarter_pot", 0.25), ("btn_half_pot", 0.5), ("btn_three_quarter_pot", 0.75), ("btn_pot", 1.0),
@@ -989,20 +990,31 @@ class HoldemApp(tk.Tk):
 
     # Rendering
 
-    def _photo(self, code: str | None, small: bool, scale: float = 1.0) -> tk.PhotoImage:
+    def _photo(self, code: str | None, small: bool, scale: float = 1.0, grey: bool = False) -> tk.PhotoImage:
         path = card_image_path(Card.from_code(code), small=small) if code else card_back_path(small=small)
         level = round(scale * 5)
-        key = (str(path), level)
+        key = (str(path), level, grey)
         if key not in self.photos:
-            if level == 5:
+            if grey:
+                self.photos[key] = self._greyed(self._photo(code, small, scale))
+            elif level == 5:
                 data = base64.b64encode(path.read_bytes()).decode("ascii")
                 self.photos[key] = tk.PhotoImage(master=self, data=data, format="png")
             else:
                 self.photos[key] = self._photo(code, small).zoom(level, 1).subsample(5, 1)
         return self.photos[key]
 
+    def _greyed(self, image: tk.PhotoImage) -> tk.PhotoImage:
+        """A darker greyscale copy, for folded cards."""
+        rows = image.data(grayscale=True)  # each row: "#rrggbb #rrggbb ..." with r == g == b
+        shade = ["#" + f"{round(level * FOLDED_SHADE):02x}" * 3 for level in range(256)]
+        greyed = tk.PhotoImage(master=self, width=image.width(), height=image.height())
+        greyed.put(" ".join("{" + " ".join(shade[int(color[1:3], 16)] for color in row.split()) + "}" for row in rows))
+        return greyed
+
     def _draw_card(
-        self, x: float, y: float, code: str | None, small: bool, scale: float = 1.0, tags: tuple[str, ...] = ("dyn",)
+        self, x: float, y: float, code: str | None, small: bool, scale: float = 1.0, tags: tuple[str, ...] = ("dyn",),
+        grey: bool = False,
     ) -> None:
         width, height = (SMALL_W, SMALL_H) if small else (CARD_W, CARD_H)
         if scale == 1.0:
@@ -1010,7 +1022,7 @@ class HoldemApp(tk.Tk):
                 self.canvas, x - width / 2 + 2, y - height / 2 + 3, x + width / 2 + 2, y + height / 2 + 3, 6,
                 fill=CARD_SHADOW, outline="", tags=tags,
             )
-        self.canvas.create_image(x, y, image=self._photo(code, small, scale), tags=tags)
+        self.canvas.create_image(x, y, image=self._photo(code, small, scale, grey), tags=tags)
 
     def _render(self) -> None:
         canvas = self.canvas
@@ -1115,7 +1127,7 @@ class HoldemApp(tk.Tk):
         if ("seat", index) not in self.hidden:
             if seat["cards"]:
                 for (cx, cy), code in zip(self._hole_points(index), seat["cards"]):
-                    self._draw_card(cx, cy, code, small=True)
+                    self._draw_card(cx, cy, code, small=True, grey=seat["folded"])
             elif seat["in_hand"] and not seat["folded"]:
                 for cx, cy in self._hole_points(index):
                     self._draw_card(cx, cy, None, small=True)

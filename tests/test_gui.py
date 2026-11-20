@@ -465,6 +465,26 @@ def test_check_is_offered_when_free(app, scheduler):
     assert network.sent == [protocol.action("check")]
 
 
+def drawn_images(app):
+    return {app.canvas.itemcget(item, "image") for item in app.canvas.find_withtag("dyn") if app.canvas.type(item) == "image"}
+
+
+def test_your_folded_cards_turn_grey(app, scheduler):
+    live = seat(0, "alice", 98, in_hand=True, cards=["AS", "KD"])
+    enter_table(app, state(0, [live, seat(1, "bob", 98, in_hand=True)], hand(to_act=1)))
+    normal = {str(app._photo(code, small=True)) for code in ("AS", "KD")}
+    assert normal <= drawn_images(app)
+
+    folded = {**live, "folded": True}
+    app.handle_message(state(0, [folded, seat(1, "bob", 98, in_hand=True)], hand(to_act=1)))
+
+    greyed = {str(app._photo(code, small=True, grey=True)) for code in ("AS", "KD")}
+    assert greyed <= drawn_images(app)
+    assert not normal & drawn_images(app)
+    red, green, blue = app._photo("AS", small=True, grey=True).get(30, 40)
+    assert red == green == blue and red < 200
+
+
 def flop_bet_ready(app, scheduler, pot):
     legal = LegalActions(frozenset({Action.FOLD, Action.CHECK, Action.BET, Action.ALL_IN}), min_raise_to=2, max_raise_to=98)
     seats = [seat(0, "alice", 98, in_hand=True, cards=["AS", "KD"]), seat(1, "bob", 98, in_hand=True)]
