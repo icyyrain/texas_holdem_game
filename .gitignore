@@ -10,3 +10,5 @@ venv/
 dist/
 build/
 *.spec
+# The game server address baked into the exe; private, see scripts/build_exe.ps1.
+assets/server_url.txt

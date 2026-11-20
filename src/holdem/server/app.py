@@ -1,4 +1,4 @@
-"""WebSocket front end: each connection becomes a room participant."""
+"""WebSocket front end: each connection becomes a lobby session (and a room participant once it joins a room)."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from websockets.exceptions import ConnectionClosed
 from holdem import protocol
 from holdem.bots import Policy
 from holdem.core.cards import Deck
-from holdem.core.table import TableConfig
-from holdem.server.room import JoinError, Member, Room
+from holdem.server.lobby import Lobby, Session
+from holdem.server.room import JoinError
 from holdem.strategy import smart_action
 
 log = logging.getLogger(__name__)
@@ -59,41 +59,41 @@ class Connection:
 
 
 class GameServer:
-    def __init__(self, room: Room):
-        self.room = room
+    def __init__(self, lobby: Lobby):
+        self.lobby = lobby
         self.connections: dict[str, Connection] = {}
 
     async def handler(self, websocket: ServerConnection) -> None:
         connection = Connection(websocket)
         sender = asyncio.create_task(connection.pump())
-        member = None
+        session = None
         try:
-            member = await self._handshake(connection)
-            if member is not None:
-                old = self.connections.get(member.player_id)
-                self.connections[member.player_id] = connection
+            session = await self._handshake(connection)
+            if session is not None:
+                old = self.connections.get(session.player_id)
+                self.connections[session.player_id] = connection
                 if old is not None:
                     # The same player joined again with their token, so the old connection is stale.
                     old.deliver(protocol.error("replaced", "you joined again from another connection"))
                     old.close(hang_up="replaced")
-                await self._serve(member, connection)
+                await self._serve(session, connection)
         except ConnectionClosed:
             pass
         finally:
-            if member is not None:
-                self.room.disconnect(member.player_id, connection)
-                if self.connections.get(member.player_id) is connection:
-                    del self.connections[member.player_id]
+            if session is not None:
+                self.lobby.disconnect(session.player_id, connection)
+                if self.connections.get(session.player_id) is connection:
+                    del self.connections[session.player_id]
             connection.close()
             await sender
 
-    async def _handshake(self, connection: Connection) -> Member | None:
+    async def _handshake(self, connection: Connection) -> Session | None:
         try:
             text = await asyncio.wait_for(connection.websocket.recv(), HELLO_TIMEOUT)
             message = protocol.decode_client(text)
             if message["type"] != "hello":
                 raise protocol.ProtocolError("the first message must be hello")
-            return self.room.join(
+            return self.lobby.join(
                 connection, message["nickname"], message["password"], message["version"], message["token"]
             )
         except TimeoutError:
@@ -102,9 +102,9 @@ class GameServer:
             connection.deliver(protocol.error(error.code, str(error)))
             return None
 
-    async def _serve(self, member: Member, connection: Connection) -> None:
+    async def _serve(self, session: Session, connection: Connection) -> None:
         async for text in connection.websocket:
-            if member.participant is not connection:
+            if session.participant is not connection:
                 return  # replaced by a newer connection
             try:
                 message = protocol.decode_client(text)
@@ -114,31 +114,32 @@ class GameServer:
                 connection.deliver(protocol.error(error.code, str(error)))
                 continue
             try:
-                self.room.handle(member.player_id, message)
+                self.lobby.handle(session.player_id, message)
             except Exception:
-                log.exception("failed to handle %s from %s", message["type"], member.name)
+                log.exception("failed to handle %s from %s", message["type"], session.name)
                 connection.deliver(protocol.error("server_error", "the server could not handle that"))
 
 
 async def start_server(
-    config: TableConfig,
     host: str = "0.0.0.0",
     port: int = protocol.DEFAULT_PORT,
     password: str | None = None,
-    bots: int = 0,
+    max_rooms: int = 10,
+    max_bots: int = 5,
     hand_delay: float = 3.0,
     bot_think: float = 1.0,
-    deck_factory: Callable[[], Deck] | None = None,
+    bot_policy: Policy = smart_action,
+    action_timeout: float = 30.0,
     reconnect_grace: float = 120.0,
-    bot_policy: Policy | None = None,
-) -> tuple[Server, Room]:
+    empty_room_timeout: float = 600.0,
+    deck_factory: Callable[[], Deck] | None = None,
+) -> tuple[Server, Lobby]:
     """Start listening on the running loop. ``port=0`` picks a free port (see ``server.sockets``)."""
     loop = asyncio.get_running_loop()
-    room = Room(
-        config, loop.call_later, password=password, hand_delay=hand_delay, deck_factory=deck_factory,
-        clock=loop.time, reconnect_grace=reconnect_grace,
+    lobby = Lobby(
+        loop.call_later, clock=loop.time, password=password, max_rooms=max_rooms, max_bots=max_bots,
+        hand_delay=hand_delay, bot_think=bot_think, bot_policy=bot_policy, action_timeout=action_timeout,
+        reconnect_grace=reconnect_grace, empty_room_timeout=empty_room_timeout, deck_factory=deck_factory,
     )
-    for number in range(1, bots + 1):
-        room.add_bot(f"Bot {number}", think=bot_think, policy=bot_policy or smart_action)
-    server = await serve(GameServer(room).handler, host, port, max_size=protocol.MAX_MESSAGE_BYTES)
-    return server, room
+    server = await serve(GameServer(lobby).handler, host, port, max_size=protocol.MAX_MESSAGE_BYTES)
+    return server, lobby

@@ -2,7 +2,7 @@ import asyncio
 
 from holdem import protocol
 from holdem.core.betting import Action, LegalActions
-from holdem.core.table import TableConfig
+from holdem.bots import random_action
 from holdem.server.app import start_server
 from holdem.textclient import TextClient, run
 
@@ -80,6 +80,43 @@ def test_table_commands():
     assert client.command("") == (None, [])
 
 
+ROOMS = [
+    {"id": "ABC234", "name": "friday", "small_blind": 1, "big_blind": 2, "players": 3, "seats": 9, "locked": False},
+    {"id": "XYZ789", "name": "high", "small_blind": 5, "big_blind": 10, "players": 0, "seats": 9, "locked": True},
+]
+
+
+def test_the_lobby_lists_rooms_until_you_join_one():
+    client = TextClient()
+
+    assert client.on_message(protocol.welcome("p1", "tok"))[0] == "Connected to the lobby."
+    assert client.on_message(protocol.rooms([])) == ["No rooms yet. Open one with: create NAME 1/2"]
+    assert client.on_message(protocol.rooms(ROOMS)) == [
+        "Rooms:",
+        "  1. friday · blinds 1/2 · 3/9 seated",
+        "  2. high · blinds 5/10 · 0/9 seated (password)",
+    ]
+    config = {"small_blind": 1, "big_blind": 2, "min_buy_in": 40, "max_buy_in": 200, "max_seats": 9, "action_timeout": 30}
+    joined = {"type": "room_joined", "room": "ABC234", "name": "friday", "config": config}
+    assert client.on_message(joined) == ["Joined friday. Blinds 1/2, buy-in 40-200, 9 seats."]
+    assert client.on_message(protocol.rooms(ROOMS)) == []
+    assert client.on_message(protocol.room_left()) == ["Back in the lobby."]
+
+
+def test_lobby_commands():
+    client = TextClient()
+    client.on_message(protocol.rooms(ROOMS))
+
+    assert client.command("create friday 1/2") == (protocol.create_room("friday", 1, 2), [])
+    assert client.command("create friday 1/2 3 pw") == (protocol.create_room("friday", 1, 2, password="pw", bots=3), [])
+    assert client.command("create friday 1/2 pw") == (protocol.create_room("friday", 1, 2, password="pw"), [])
+    assert client.command("create friday one")[1][0].startswith("Usage: create")
+    assert client.command("join 2 pw") == (protocol.join_room("XYZ789", "pw"), [])
+    assert client.command("join 1") == (protocol.join_room("ABC234"), [])
+    assert client.command("join 3") == (None, ["There is no room 3. Type rooms to see the list."])
+    assert client.command("exit") == (protocol.leave_room(), [])
+
+
 def test_errors_are_shown():
     assert TextClient().on_message(protocol.error("invalid", "that seat is taken")) == ["! that seat is taken"]
 
@@ -91,15 +128,16 @@ async def wait_for(lines, text, timeout=3.0):
 
 
 async def test_text_client_plays_against_a_server_bot():
-    config = TableConfig(small_blind=1, big_blind=2, min_buy_in=40, max_buy_in=200, max_seats=4)
-    server, _ = await start_server(config, host="127.0.0.1", port=0, bots=1, bot_think=0.01, hand_delay=0.01)
+    server, _ = await start_server(host="127.0.0.1", port=0, bot_think=0.01, hand_delay=0.01, bot_policy=random_action)
     port = server.sockets[0].getsockname()[1]
     typed: asyncio.Queue = asyncio.Queue()
     shown: list[str] = []
     try:
         session = asyncio.create_task(run(f"ws://127.0.0.1:{port}", "alice", None, typed, shown.append))
-        await wait_for(shown, "Connected.")
-        await typed.put("sit 2 100")
+        await wait_for(shown, "Connected to the lobby.")
+        await typed.put("create test 1/2 1")
+        await wait_for(shown, "Joined test.")
+        await typed.put("sit 3 100")
         await wait_for(shown, "Your turn")
         await typed.put("f")
         await wait_for(shown, "alice folds")
@@ -114,8 +152,7 @@ async def test_text_client_plays_against_a_server_bot():
 
 
 async def test_wrong_password_is_reported():
-    config = TableConfig(small_blind=1, big_blind=2, min_buy_in=40, max_buy_in=200)
-    server, _ = await start_server(config, host="127.0.0.1", port=0, password="pw")
+    server, _ = await start_server(host="127.0.0.1", port=0, password="pw")
     port = server.sockets[0].getsockname()[1]
     shown: list[str] = []
     try:
@@ -125,7 +162,7 @@ async def test_wrong_password_is_reported():
         await server.wait_closed()
 
     assert code == 1
-    assert shown == ["! wrong room password", "Disconnected from the server."]
+    assert shown == ["! wrong server password", "Disconnected from the server."]
 
 
 async def test_unreachable_server_is_reported():

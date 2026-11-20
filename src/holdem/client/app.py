@@ -1,12 +1,12 @@
-"""tkinter desktop client: a lobby to create or join a room, then the table.
+"""tkinter desktop client: sign in with a nickname, pick or create a room, then play at its table.
 
-Everything is drawn on one Canvas. Server messages arrive on the network thread's queue and
-are polled with ``after``. Events become animation steps; while they play, the action buttons
-stay locked and the drawn view (``self.view``) lags the server's ``table_state``
-(``self.state``), which replaces it once the queue drains.
+The server address is fixed (see ``settings``). Everything is drawn on one Canvas. Server messages
+arrive on the network thread's queue and are polled with ``after``. Events become animation
+steps; while they play, the action buttons stay locked and the drawn view (``self.view``) lags
+the server's ``table_state`` (``self.state``), which replaces it once the queue drains.
 
-If the connection drops at the table, the client reconnects with the token from ``welcome`` and
-the server answers with a fresh ``table_state``.
+If the connection drops, the client reconnects with the token from ``welcome``; the server puts
+it back into its room (``room_joined`` and a fresh ``table_state``) or the lobby (``rooms``).
 """
 
 from __future__ import annotations
@@ -44,7 +44,6 @@ from holdem.client.canvas_ui import (
     lerp_color,
 )
 from holdem.client.card_images import card_back_path, card_image_path
-from holdem.client.host import EmbeddedServer, lan_addresses
 from holdem.client.layout import (
     BOTTOM_RAIL_TOP,
     CONTROL_Y,
@@ -61,6 +60,7 @@ from holdem.client.layout import (
     toward_center,
 )
 from holdem.client.network import NetworkClient
+from holdem.client.settings import server_url
 from holdem.core.betting import Action
 from holdem.core.cards import Card
 from holdem.core.table import TableConfig
@@ -97,44 +97,53 @@ JOIN_ERRORS = {
     "nickname_taken": "error_nickname_taken",
     "version_mismatch": "error_version_mismatch",
 }
+ROOM_ERRORS = {
+    "bad_password": "error_bad_password",
+    "room_not_found": "error_room_not_found",
+    "too_many_rooms": "error_too_many_rooms",
+}
+MAX_BOTS = 5
+ROOM_ROWS_TOP, ROOM_ROW_STEP, MAX_ROOM_ROWS = 186, 41, 10
+ROOM_NAME_SHOWN = 14  # characters of a room name the list has room for
 
 Step = Callable[[Callable[[], None]], None]
 AskInteger = Callable[[str, str, int, int, int], "int | None"]
+AskPassword = Callable[[str, str], "str | None"]
 
 
 class HoldemApp(tk.Tk):
     def __init__(
         self,
         network_factory: Callable[[], NetworkClient] = NetworkClient,
-        server_factory: Callable[..., EmbeddedServer] = EmbeddedServer,
         ask_integer: AskInteger | None = None,
+        ask_password: AskPassword | None = None,
+        server: str | None = None,
     ) -> None:
         super().__init__()
         self.geometry(f"{WIDTH}x{HEIGHT}")
         self.resizable(False, False)
         self.configure(bg=RAIL_DARK)
         self.network_factory = network_factory
-        self.server_factory = server_factory
         self.ask_integer = ask_integer or self._ask_integer
+        self.ask_password = ask_password or self._ask_password
+        self.server = server or server_url()
         self.language = "zh"
         self.frame_ms = 16
         self.slide_frames = 10
         self.gap_ms = 60
-        self.screen = "lobby"
+        self.screen = "login"  # then "rooms" and "table"
         self.network: NetworkClient | None = None
-        self.server: EmbeddedServer | None = None
-        self.connecting = False
+        self.connecting = False  # waiting for the server to let us in (to the lobby or a room)
         self.reconnecting = False
         self.reconnect_attempts = 0
-        self._session = 0  # bumped whenever a room is entered or left, so stale reconnects give up
-        self.url = ""
+        self._session = 0  # bumped on every sign-in and sign-out, so stale reconnects give up
         self.nickname = ""
-        self.password: str | None = None
         self.token: str | None = None
         self.clock: Callable[[], float] = time.monotonic
         self.deadline: float | None = None  # when the seat to act runs out of time, on self.clock
         self.lobby_status: tuple[str, dict, bool] | None = None
-        self.room_address = ""
+        self.rooms: list[protocol.Message] = []
+        self.room_name = ""
         self.config_info: protocol.Message | None = None
         self.state: protocol.Message | None = None
         self.view: protocol.Message | None = None
@@ -150,9 +159,7 @@ class HoldemApp(tk.Tk):
         self.vars = {
             name: tk.StringVar(self, value)
             for name, value in (
-                ("nickname", ""), ("create_port", str(protocol.DEFAULT_PORT)), ("create_password", ""),
-                ("blinds", "1/2"), ("bots", "0"), ("join_host", "127.0.0.1"),
-                ("join_port", str(protocol.DEFAULT_PORT)), ("join_password", ""),
+                ("nickname", ""), ("room_name", ""), ("blinds", "1/2"), ("room_password", ""), ("bots", "0"),
             )
         }
         # The raise slider picks an index into raise_steps (big-blind steps, see layout.bet_steps).
@@ -163,7 +170,7 @@ class HoldemApp(tk.Tk):
         self.canvas.pack(fill="both", expand=True)
         self._draw_background()
         self.language_button = CanvasButton(self.canvas, (1140, 28), (80, 32), self.toggle_language, "ghost")
-        self._show_lobby()
+        self._show_login()
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.after(POLL_MS, self._poll)
         self.after(TIMER_MS, self._tick_timer)
@@ -182,6 +189,9 @@ class HoldemApp(tk.Tk):
         return simpledialog.askinteger(
             title, prompt, parent=self, minvalue=minimum, maxvalue=maximum, initialvalue=initial
         )
+
+    def _ask_password(self, title: str, prompt: str) -> str | None:
+        return simpledialog.askstring(title, prompt, parent=self, show="•")
 
     # Static drawing
 
@@ -231,7 +241,7 @@ class HoldemApp(tk.Tk):
         self.title(self.t("window_title"))
         self._draw_title()
         self.language_button.set_text(self.t("btn_language"), self._font(14, "bold"))
-        if self.screen == "lobby":
+        if self.screen in ("login", "rooms"):
             self._draw_lobby_text()
         else:
             self._label_table_buttons()
@@ -242,31 +252,27 @@ class HoldemApp(tk.Tk):
         self.language = "en" if self.language == "zh" else "zh"
         self._apply_language()
 
-    # Lobby
+    # Signing in
 
-    def _show_lobby(self, status: tuple[str, dict, bool] | None = None) -> None:
-        self.screen = "lobby"
-        self.connecting = False
-        self.lobby_status = status
-        canvas = self.canvas
-        canvas.delete("table_ui", "dyn", "sprite", "lobby")
+    def _clear_screen(self) -> None:
+        self.canvas.delete("table_ui", "dyn", "sprite", "marks", "lobby")
         for widget in self.widgets:
             widget.destroy()
         self.widgets = []
 
-        for x0 in (170, 630):
-            create_rounded_rect(canvas, x0, 214, x0 + 400, 566, 18, fill=PANEL, outline=GOLD_DARK, width=2, tags="lobby")
-        self._lobby_entry("nickname", 600, 150, 220)
-        rows = (("create_port", 330), ("create_password", 375), ("blinds", 420), ("bots", 465))
-        for name, y in rows:
-            self._lobby_entry(name, 450, y, 150, secret=name.endswith("password"))
-        for name, y in (("join_host", 330), ("join_port", 375), ("join_password", 420)):
-            self._lobby_entry(name, 910, y, 150, secret=name.endswith("password"))
-        self.create_button = CanvasButton(canvas, (370, 522), (190, 46), self.create_room, "primary", tags=("lobby",))
-        self.join_button = CanvasButton(canvas, (830, 522), (190, 46), self.join_room, "primary", tags=("lobby",))
+    def _show_login(self, status: tuple[str, dict, bool] | None = None) -> None:
+        self.screen = "login"
+        self.connecting = False
+        self.lobby_status = status
+        self._clear_screen()
+        canvas = self.canvas
+        create_rounded_rect(canvas, 380, 220, 820, 470, 18, fill=PANEL, outline=GOLD_DARK, width=2, tags="lobby")
+        entry = self._lobby_entry("nickname", 650, 334, 220)
+        entry.bind("<Return>", lambda _event: self.sign_in())
+        self.sign_in_button = CanvasButton(canvas, (600, 412), (200, 46), self.sign_in, "primary", tags=("lobby",))
         self._apply_language()
 
-    def _lobby_entry(self, name: str, x: float, y: float, width: int, secret: bool = False) -> None:
+    def _lobby_entry(self, name: str, x: float, y: float, width: int, secret: bool = False) -> tk.Entry:
         entry = tk.Entry(
             self.canvas, textvariable=self.vars[name], justify="center", font=(NUMBER_FONT, -17, "bold"),
             bg="#0f3a24", fg=CREAM, insertbackground=GOLD, relief="flat", highlightthickness=1,
@@ -274,42 +280,35 @@ class HoldemApp(tk.Tk):
         )
         self.canvas.create_window(x, y, window=entry, width=width, height=32, tags="lobby")
         self.widgets.append(entry)
+        return entry
 
     def _draw_lobby_text(self) -> None:
+        self.canvas.delete("lobby_text")
+        if self.screen == "login":
+            self._draw_login_text()
+        elif self.screen == "rooms":
+            self._draw_rooms_text()
+
+    def _draw_login_text(self) -> None:
         canvas = self.canvas
-        canvas.delete("lobby_text")
         tags = ("lobby", "lobby_text")
-        canvas.create_text(480, 150, text=self.t("label_nickname"), anchor="e", font=self._font(17, "bold"), fill=GOLD, tags=tags)
-        for x, title, hint in ((370, "btn_create_room", "lobby_create_hint"), (830, "btn_join_room", "lobby_join_hint")):
-            canvas.create_text(x, 246, text=self.t(title), font=self._font(22, "bold"), fill=GOLD, tags=tags)
-            canvas.create_text(x, 278, text=self.t(hint), font=self._font(13), fill=MUTED, tags=tags)
-        labels = (
-            (360, 330, "label_port"), (360, 375, "label_password"), (360, 420, "label_blinds"), (360, 465, "label_bots"),
-            (820, 330, "label_host"), (820, 375, "label_port"), (820, 420, "label_password"),
-        )
-        for x, y, key in labels:
-            canvas.create_text(x, y, text=self.t(key), anchor="e", font=self._font(15, "bold"), fill=CREAM, tags=tags)
-        canvas.create_text(830, 465, text=self.t("lobby_password_hint"), font=self._font(13), fill=MUTED, tags=tags)
+        canvas.create_text(600, 266, text=self.t("login_hint"), font=self._font(20, "bold"), fill=GOLD, tags=tags)
+        canvas.create_text(528, 334, text=self.t("label_nickname"), anchor="e", font=self._font(16, "bold"), fill=CREAM, tags=tags)
+        self._draw_lobby_status(520)
+        self.sign_in_button.set_text(self.t("btn_enter_lobby"), self._font(17, "bold"))
+        self.sign_in_button.set_enabled(not self.connecting)
+
+    def _draw_lobby_status(self, y: float) -> None:
         if self.lobby_status:
             key, values, is_error = self.lobby_status
-            canvas.create_text(
-                WIDTH / 2, 598, text=self.t(key, **values), font=self._font(16, "bold"), fill=ERROR if is_error else CREAM,
-                tags=(*tags, "lobby_status"),
+            self.canvas.create_text(
+                WIDTH / 2, y, text=self.t(key, **values), font=self._font(16, "bold"), fill=ERROR if is_error else CREAM,
+                tags=("lobby", "lobby_text", "lobby_status"),
             )
-        self.create_button.set_text(self.t("btn_create_room"), self._font(17, "bold"))
-        self.join_button.set_text(self.t("btn_join_room"), self._font(17, "bold"))
-        self.create_button.set_enabled(not self.connecting)
-        self.join_button.set_enabled(not self.connecting)
 
     def _set_lobby_status(self, key: str, is_error: bool = True, **values: object) -> None:
         self.lobby_status = (key, values, is_error)
         self._draw_lobby_text()
-
-    def _read_port(self, name: str) -> int | None:
-        text = self.vars[name].get().strip()
-        if text.isascii() and text.isdigit() and 1 <= int(text) <= 65535:
-            return int(text)
-        return None
 
     def _read_nickname(self) -> str | None:
         nickname = self.vars["nickname"].get().strip()
@@ -318,115 +317,173 @@ class HoldemApp(tk.Tk):
             return None
         return nickname
 
-    def create_room(self) -> None:
+    def sign_in(self) -> None:
+        if self.screen != "login" or self.connecting:
+            return
         nickname = self._read_nickname()
         if nickname is None:
             return
-        port = self._read_port("create_port")
-        if port is None:
-            self._set_lobby_status("error_port")
-            return
-        try:
-            small, big = (int(part) for part in self.vars["blinds"].get().split("/"))
-            config = TableConfig(small, big, min_buy_in=20 * big, max_buy_in=100 * big)
-        except ValueError:
-            self._set_lobby_status("error_blinds")
-            return
-        bots_text = self.vars["bots"].get().strip()
-        if not (bots_text.isascii() and bots_text.isdigit() and int(bots_text) <= 8):
-            self._set_lobby_status("error_bots")
-            return
-        password = self.vars["create_password"].get() or None
-        self.server = self.server_factory(config, port, password, int(bots_text))
-        self.server.start()
-        self.connecting = True
-        self._set_lobby_status("status_starting_server", is_error=False)
-        self._wait_for_server(nickname, password)
-
-    def _wait_for_server(self, nickname: str, password: str | None) -> None:
-        server = self.server
-        if server is None:
-            return
-        if not server.ready.is_set():
-            self._schedule(50, lambda: self._wait_for_server(nickname, password))
-            return
-        if server.error:
-            self.server = None
-            self.connecting = False
-            self._set_lobby_status("error_server_failed", reason=server.error)
-            return
-        self.room_address = f"{lan_addresses()[0]}:{server.port}"
-        self._connect(f"ws://127.0.0.1:{server.port}", nickname, password)
-
-    def join_room(self) -> None:
-        nickname = self._read_nickname()
-        if nickname is None:
-            return
-        host = self.vars["join_host"].get().strip()
-        port = self._read_port("join_port")
-        if port is None:
-            self._set_lobby_status("error_port")
-            return
-        self.room_address = host if "://" in host else f"{host}:{port}"
-        url = host if "://" in host else f"ws://{host}:{port}"
-        self._connect(url, nickname, self.vars["join_password"].get() or None)
-
-    def _connect(self, url: str, nickname: str, password: str | None) -> None:
         self.connecting = True
         self._session += 1
-        self.url, self.nickname, self.password, self.token = url, nickname, password, None
+        self.nickname, self.token = nickname, None
         self.network = self.network_factory()
-        self.network.connect(url, protocol.hello(nickname, password))
+        self.network.connect(self.server, protocol.hello(nickname))
         self._set_lobby_status("status_connecting", is_error=False)
 
+    def sign_out(self) -> None:
+        self._sign_out(None)
+
+    def _sign_out(self, status: tuple[str, dict, bool] | None) -> None:
+        self._session += 1
+        self.reconnecting = False
+        self.reconnect_attempts = 0
+        if self.network is not None:
+            self.network.close()
+            self.network = None
+        self.token = None
+        self.rooms = []
+        self._reset_table()
+        self._show_login(status)
+
     def _connection_lost(self) -> None:
-        """At the table, keep trying to get back in with our token; give up after a while."""
+        """Keep trying to get back in with our token; give up after a while."""
         self.network = None
         self.turn = None
         if self.reconnect_attempts >= RECONNECT_ATTEMPTS:
-            self._leave_room(("error_disconnected", {}, True))
+            self._sign_out(("error_disconnected", {}, True))
             return
         self.reconnecting = True
         self.reconnect_attempts += 1
         session = self._session
         self._schedule(RECONNECT_MS, lambda: self._reconnect(session))
-        self._render()
-        self._update_controls()
+        if self.screen == "rooms":
+            self.connecting = False
+            self._set_lobby_status("status_reconnecting")
+        else:
+            self._render()
+            self._update_controls()
 
     def _reconnect(self, session: int) -> None:
         if session != self._session or not self.reconnecting:
             return
         self.network = self.network_factory()
-        self.network.connect(self.url, protocol.hello(self.nickname, self.password, self.token))
+        self.network.connect(self.server, protocol.hello(self.nickname, None, self.token))
 
-    def _leave_room(self, status: tuple[str, dict, bool] | None) -> None:
-        self._session += 1
-        self.reconnecting = False
-        self.reconnect_attempts = 0
-        self.deadline = None
+    def close(self) -> None:
         if self.network is not None:
             self.network.close()
-            self.network = None
-        if self.server is not None:
-            self.server.stop()
-            self.server = None
+        self.destroy()
+
+    # Room list
+
+    def _show_rooms(self, status: tuple[str, dict, bool] | None = None) -> None:
+        self._reset_table()
+        self.screen = "rooms"
+        self.connecting = False
+        self.lobby_status = status
+        self._clear_screen()
+        canvas = self.canvas
+        create_rounded_rect(canvas, 60, 96, 720, 600, 18, fill=PANEL, outline=GOLD_DARK, width=2, tags="lobby")
+        create_rounded_rect(canvas, 760, 96, 1140, 600, 18, fill=PANEL, outline=GOLD_DARK, width=2, tags="lobby")
+        if not self.vars["room_name"].get().strip():
+            self.vars["room_name"].set(self.t("default_room_name", name=self.nickname)[:protocol.MAX_ROOM_NAME])
+        for name, y in (("room_name", 230), ("blinds", 290), ("room_password", 350), ("bots", 410)):
+            self._lobby_entry(name, 1012, y, 170, secret=name == "room_password")
+        self.create_button = CanvasButton(canvas, (950, 528), (200, 46), self.create_room, "primary", tags=("lobby",))
+        self.sign_out_button = CanvasButton(canvas, (1030, 28), (110, 32), self.sign_out, "ghost", tags=("lobby",))
+        self._apply_language()
+
+    def _draw_rooms_text(self) -> None:
+        canvas = self.canvas
+        tags = ("lobby", "lobby_text")
+        canvas.create_text(90, 134, text=self.t("rooms_title"), anchor="w", font=self._font(22, "bold"), fill=GOLD, tags=tags)
+        canvas.create_text(
+            690, 134, text=self.t("status_signed_in", name=self.nickname), anchor="e", font=self._font(14), fill=MUTED,
+            tags=tags,
+        )
+        canvas.create_text(950, 134, text=self.t("btn_create_room"), font=self._font(22, "bold"), fill=GOLD, tags=tags)
+        for key, y in (("label_room_name", 230), ("label_blinds", 290), ("label_password", 350), ("label_bots", 410)):
+            canvas.create_text(910, y, text=self.t(key), anchor="e", font=self._font(15, "bold"), fill=CREAM, tags=tags)
+        canvas.create_text(950, 462, text=self.t("lobby_password_hint"), font=self._font(13), fill=MUTED, tags=tags)
+        self._draw_lobby_status(614)
+        self.create_button.set_text(self.t("btn_create_room"), self._font(17, "bold"))
+        self.create_button.set_enabled(not self.connecting and not self.reconnecting)
+        self.sign_out_button.set_text(self.t("btn_logout"), self._font(13, "bold"))
+        self._draw_room_list()
+
+    def _draw_room_list(self) -> None:
+        canvas = self.canvas
+        canvas.delete("room_rows")
+        if not self.rooms:
+            canvas.create_text(390, 360, text=self.t("rooms_empty"), font=self._font(16), fill=MUTED, tags=("lobby", "room_rows"))
+            return
+        for index, room in enumerate(self.rooms[:MAX_ROOM_ROWS]):
+            y = ROOM_ROWS_TOP + index * ROOM_ROW_STEP
+            tag = f"room-{room['id']}"
+            tags = ("lobby", "room_rows", tag)
+            name = room["name"] if len(room["name"]) <= ROOM_NAME_SHOWN else room["name"][:ROOM_NAME_SHOWN - 1] + "…"
+            create_rounded_rect(canvas, 84, y - 18, 696, y + 18, 8, fill="#0f3a24", outline=GOLD_DARK, tags=tags)
+            canvas.create_text(104, y, text=name, anchor="w", font=self._font(15, "bold"), fill=CREAM, tags=tags)
+            blinds = self.t("blinds", small=room["small_blind"], big=room["big_blind"])
+            canvas.create_text(470, y, text=blinds, font=self._font(14), fill=CREAM, tags=tags)
+            players = self.t("room_players", players=room["players"], seats=room["seats"])
+            canvas.create_text(588, y, text=players, font=self._font(14), fill=CREAM, tags=tags)
+            if room["locked"]:
+                canvas.create_text(680, y, text=self.t("room_locked"), anchor="e", font=self._font(13, "bold"), fill=GOLD, tags=tags)
+            canvas.tag_bind(tag, "<Button-1>", lambda _event, chosen=room: self.enter_room(chosen))
+            canvas.tag_bind(tag, "<Enter>", lambda _event: canvas.config(cursor="hand2"))
+            canvas.tag_bind(tag, "<Leave>", lambda _event: canvas.config(cursor=""))
+
+    def enter_room(self, room: protocol.Message) -> None:
+        if self.screen != "rooms" or self.connecting or self.reconnecting:
+            return
+        password = None
+        if room["locked"]:
+            password = self.ask_password(self.t("dialog_room_password_title"), self.t("dialog_room_password", name=room["name"]))
+            if password is None:
+                return
+        self.connecting = True
+        self._send(protocol.join_room(room["id"], password))
+        self._set_lobby_status("status_entering_room", is_error=False)
+
+    def create_room(self) -> None:
+        if self.screen != "rooms" or self.connecting or self.reconnecting:
+            return
+        name = self.vars["room_name"].get().strip()
+        if not name or len(name) > protocol.MAX_ROOM_NAME or not name.isprintable():
+            self._set_lobby_status("error_room_name", max=protocol.MAX_ROOM_NAME)
+            return
+        try:
+            small, big = (int(part) for part in self.vars["blinds"].get().split("/"))
+            TableConfig(small, big, min_buy_in=20 * big, max_buy_in=100 * big)
+        except ValueError:
+            self._set_lobby_status("error_blinds")
+            return
+        bots_text = self.vars["bots"].get().strip()
+        if not (bots_text.isascii() and bots_text.isdigit() and int(bots_text) <= MAX_BOTS):
+            self._set_lobby_status("error_bots")
+            return
+        password = self.vars["room_password"].get() or None
+        self.connecting = True
+        self._send(protocol.create_room(name, small, big, password=password, bots=int(bots_text)))
+        self._set_lobby_status("status_entering_room", is_error=False)
+
+    def exit_room(self) -> None:
+        """Back to the room list (the seat is given up)."""
+        if self.reconnecting:
+            self._sign_out(None)
+        else:
+            self._send(protocol.leave_room())
+
+    def _reset_table(self) -> None:
+        self.deadline = None
         self.state = self.view = self.turn = self.config_info = None
         self.queue.clear()
         self.animating = False
         self.hidden.clear()
         self.labels.clear()
         self.status_error = None
-        self._show_lobby(status)
-
-    def exit_room(self) -> None:
-        self._leave_room(None)
-
-    def close(self) -> None:
-        if self.network is not None:
-            self.network.close()
-        if self.server is not None:
-            self.server.stop()
-        self.destroy()
+        self.canvas.delete("sprite")
 
     # Messages
 
@@ -443,32 +500,59 @@ class HoldemApp(tk.Tk):
 
     def handle_message(self, message: protocol.Message) -> None:
         kind = message["type"]
-        if kind in ("_connect_failed", "_disconnected") and self.screen == "table":
-            self._connection_lost()
-        elif kind == "_connect_failed":
-            self._leave_room(("error_connect_failed", {"reason": message["reason"]}, True))
-        elif kind == "_disconnected":
-            self._leave_room(("error_disconnected", {}, True))
+        if kind in ("_connect_failed", "_disconnected"):
+            if self.screen in ("rooms", "table") and self.token is not None:
+                self._connection_lost()
+            elif kind == "_connect_failed":
+                self._sign_out(("error_connect_failed", {"reason": message["reason"]}, True))
+            else:
+                self._sign_out(("error_disconnected", {}, True))
         elif kind == "error":
-            if message["code"] == "replaced":
-                self._leave_room(("error_replaced", {}, True))
-            elif self.screen == "lobby" or self.reconnecting:
+            code = message["code"]
+            if code == "replaced":
+                self._sign_out(("error_replaced", {}, True))
+            elif self.screen == "login" or self.reconnecting:
                 # The server refused the hello and is about to hang up.
-                key = JOIN_ERRORS.get(message["code"])
-                status = (key, {}, True) if key else ("error_connect_failed", {"reason": message["message"]}, True)
-                self._leave_room(status)
+                key = JOIN_ERRORS.get(code)
+                self._sign_out((key, {}, True) if key else ("error_connect_failed", {"reason": message["message"]}, True))
+            elif self.screen == "rooms":
+                self.connecting = False
+                key = ROOM_ERRORS.get(code)
+                if key:
+                    self._set_lobby_status(key)
+                else:
+                    self._set_lobby_status("error_from_server", message=message["message"])
             else:
                 self._show_error(message["message"])
         elif kind == "welcome":
-            self.config_info = message["config"]
             self.token = message["token"]
-            if self.screen == "table":
-                # Back in after a dropped connection; the table_state that follows brings us up to date.
+            self.reconnect_attempts = 0
+            if self.reconnecting:
+                # Back in; room_joined (to our table) or rooms (to the lobby) follows.
                 self.reconnecting = False
-                self.reconnect_attempts = 0
                 self.labels.clear()
+                if self.screen == "rooms":
+                    self.lobby_status = None
+                    self._draw_lobby_text()
+            elif self.screen == "login":
+                self._show_rooms()
+        elif kind == "rooms":
+            self.rooms = message["rooms"]
+            if self.screen == "table":
+                # The server only sends the list to people in the lobby: our room closed while we were away.
+                self._show_rooms(("error_room_gone", {}, True))
+            elif self.screen == "rooms":
+                self._draw_room_list()
+        elif kind == "room_joined":
+            self.config_info = message["config"]
+            self.room_name = message["name"]
+            self.connecting = False
+            if self.screen == "table":
+                self._render()
             else:
                 self._show_table()
+        elif kind == "room_left":
+            self._show_rooms()
         elif kind == "table_state":
             self.state = message
             hand = message["hand"]
@@ -504,10 +588,7 @@ class HoldemApp(tk.Tk):
 
     def _show_table(self) -> None:
         canvas = self.canvas
-        canvas.delete("lobby")
-        for widget in self.widgets:
-            widget.destroy()
-        self.widgets = []
+        self._clear_screen()
         self.screen = "table"
         self.connecting = False
         tags = ("table_ui",)
@@ -1076,9 +1157,7 @@ class HoldemApp(tk.Tk):
     def _draw_room_info(self) -> None:
         if self.config_info is None:
             return
-        parts = [self.t("blinds", small=self.config_info["small_blind"], big=self.config_info["big_blind"])]
-        if self.room_address:
-            parts.append(self.t("room_address", address=self.room_address))
+        parts = [self.room_name, self.t("blinds", small=self.config_info["small_blind"], big=self.config_info["big_blind"])]
         # Right-aligned against the rail buttons so it never runs into the title.
         self.canvas.create_text(
             762, 30, text="   ·   ".join(parts), anchor="e", font=self._font(14), fill=CREAM, tags="dyn",

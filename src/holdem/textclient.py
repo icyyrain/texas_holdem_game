@@ -19,8 +19,9 @@ from holdem import protocol
 from holdem.sim import ALIASES, QUIT_WORDS, cards_text, describe_event, describe_options, parse_action
 
 HELP = (
-    "Commands: sit SEAT BUYIN · leave · rebuy AMOUNT · away · back · state · help · quit. "
-    "On your turn: f, x, c, b N, r N, a."
+    "Lobby: rooms · create NAME SB/BB [BOTS] [PASSWORD] · join N [PASSWORD]. "
+    "In a room: sit SEAT BUYIN · leave · rebuy AMOUNT · away · back · state · exit (back to the lobby). "
+    "On your turn: f, x, c, b N, r N, a. Anywhere: help · quit."
 )
 
 
@@ -31,6 +32,8 @@ class TextClient:
         self.state: protocol.Message | None = None
         self.turn: protocol.Message | None = None
         self.config: protocol.Message | None = None
+        self.rooms: list[protocol.Message] = []
+        self.room: str | None = None  # name of the room we are in
 
     def names(self) -> dict[int, str]:
         if self.state is None:
@@ -40,12 +43,21 @@ class TextClient:
     def on_message(self, message: protocol.Message) -> list[str]:
         kind = message["type"]
         if kind == "welcome":
+            return ["Connected to the lobby.", HELP]
+        if kind == "rooms":
+            self.rooms = message["rooms"]
+            return [] if self.room is not None else self.render_rooms()
+        if kind == "room_joined":
             self.config = config = message["config"]
+            self.room = message["name"]
+            self.state = None
             return [
-                f"Connected. Blinds {config['small_blind']}/{config['big_blind']}, buy-in "
-                f"{config['min_buy_in']}-{config['max_buy_in']}, {config['max_seats']} seats.",
-                HELP,
+                f"Joined {self.room}. Blinds {config['small_blind']}/{config['big_blind']}, buy-in "
+                f"{config['min_buy_in']}-{config['max_buy_in']}, {config['max_seats']} seats."
             ]
+        if kind == "room_left":
+            self.room = self.state = self.turn = self.config = None
+            return ["Back in the lobby."]
         if kind == "table_state":
             first = self.state is None
             self.state = message
@@ -71,6 +83,18 @@ class TextClient:
         cards = f" with {cards_text(seat['cards'])}" if seat and seat["cards"] else ""
         time_left = f" ({self.turn['time_left']:.0f}s)" if self.turn["time_left"] is not None else ""
         return f"Your turn{cards}{time_left}: {describe_options(protocol.legal_from_turn(self.turn))}"
+
+    def render_rooms(self) -> list[str]:
+        if not self.rooms:
+            return ["No rooms yet. Open one with: create NAME 1/2"]
+        lines = ["Rooms:"]
+        for number, room in enumerate(self.rooms, start=1):
+            lock = " (password)" if room["locked"] else ""
+            lines.append(
+                f"  {number}. {room['name']} · blinds {room['small_blind']}/{room['big_blind']} · "
+                f"{room['players']}/{room['seats']} seated{lock}"
+            )
+        return lines
 
     def render_state(self) -> list[str]:
         if self.state is None:
@@ -113,6 +137,19 @@ class TextClient:
             return None, [HELP]
         if head == "state":
             return None, self.render_state()
+        if head == "rooms":
+            return None, self.render_rooms()
+        if head == "exit":
+            return protocol.leave_room(), []
+        if head == "create":
+            return self._create(words[1:])
+        if head == "join":
+            if len(words) not in (2, 3) or not (words[1].isascii() and words[1].isdigit()):
+                return None, ["Usage: join N [PASSWORD] (N from the rooms list)"]
+            number = int(words[1])
+            if not 1 <= number <= len(self.rooms):
+                return None, [f"There is no room {number}. Type rooms to see the list."]
+            return protocol.join_room(self.rooms[number - 1]["id"], words[2] if len(words) == 3 else None), []
         if head == "leave":
             return protocol.leave(), []
         if head in ("away", "back"):
@@ -134,6 +171,23 @@ class TextClient:
                 return None, [str(error)]
             return protocol.action(action, amount), []
         return None, [f"Unknown command. {HELP}"]
+
+
+    def _create(self, args: list[str]) -> tuple[protocol.Message | None, list[str]]:
+        usage = ["Usage: create NAME SB/BB [BOTS] [PASSWORD], e.g. create friday 1/2 2"]
+        if not 2 <= len(args) <= 4:
+            return None, usage
+        name, blinds, *rest = args
+        try:
+            small, big = (int(part) for part in blinds.split("/"))
+        except ValueError:
+            return None, usage
+        bots = 0
+        if rest and rest[0].isascii() and rest[0].isdigit():
+            bots = int(rest.pop(0))
+        if len(rest) > 1:
+            return None, usage
+        return protocol.create_room(name, small, big, password=rest[0] if rest else None, bots=bots), []
 
 
 async def run(url: str, name: str, password: str | None, lines: asyncio.Queue, out=print) -> int:

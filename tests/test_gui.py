@@ -1,5 +1,4 @@
 import queue
-import threading
 
 import pytest
 
@@ -11,6 +10,7 @@ from holdem.core.betting import Action, LegalActions
 from holdem.core.table import TableConfig
 
 CONFIG = TableConfig(small_blind=1, big_blind=2, min_buy_in=40, max_buy_in=200, max_seats=6)
+SERVER = "wss://poker.example.com:8765"
 
 
 class FakeScheduler:
@@ -45,29 +45,6 @@ class FakeNetwork:
         self.closed = True
 
 
-class FakeServer:
-    instances = []
-    fail_with = None
-
-    def __init__(self, config, port, password=None, bots=0):
-        self.config, self.requested_port, self.password, self.bots = config, port, password, bots
-        self.ready = threading.Event()
-        self.port = None
-        self.error = None
-        self.stopped = False
-        FakeServer.instances.append(self)
-
-    def start(self):
-        if FakeServer.fail_with:
-            self.error = FakeServer.fail_with
-        else:
-            self.port = self.requested_port
-        self.ready.set()
-
-    def stop(self):
-        self.stopped = True
-
-
 @pytest.fixture(scope="module")
 def app():
     networks = []
@@ -81,7 +58,11 @@ def app():
         app.asked.append((minimum, maximum, initial))
         return answers.pop(0) if answers else None
 
-    app = HoldemApp(network_factory=new_network, server_factory=FakeServer, ask_integer=ask)
+    def ask_password(title, prompt):
+        app.asked.append(prompt)
+        return answers.pop(0) if answers else None
+
+    app = HoldemApp(network_factory=new_network, ask_integer=ask, ask_password=ask_password, server=SERVER)
     app.networks, app.answers, app.asked = networks, answers, []
     app.update_idletasks()
     yield app
@@ -92,18 +73,13 @@ def app():
 def scheduler(app, monkeypatch):
     fake = FakeScheduler()
     monkeypatch.setattr(app, "_schedule", fake)
-    app.exit_room()
+    app.sign_out()
     if app.language != "zh":
         app.toggle_language()
-    app.vars["nickname"].set("alice")
-    app.vars["join_host"].set("127.0.0.1")
-    app.vars["join_port"].set("8765")
-    app.vars["blinds"].set("1/2")
-    app.vars["bots"].set("0")
+    for name, value in (("nickname", "alice"), ("room_name", ""), ("blinds", "1/2"), ("room_password", ""), ("bots", "0")):
+        app.vars[name].set(value)
     app.answers.clear()
     app.asked.clear()
-    FakeServer.instances.clear()
-    FakeServer.fail_with = None
     return fake
 
 
@@ -130,11 +106,24 @@ def state(your_seat, seats, hand_view=None, max_seats=6):
     return protocol.table_state(your_seat, entries, hand_view)
 
 
-def enter_table(app, table_state):
-    app.join_room()
-    app.handle_message(protocol.welcome("alice", "tok", CONFIG))
-    app.handle_message(table_state)
+ROOMS = [
+    {"id": "ABC234", "name": "周五局", "small_blind": 1, "big_blind": 2, "players": 3, "seats": 9, "locked": False},
+    {"id": "XYZ789", "name": "高额桌", "small_blind": 5, "big_blind": 10, "players": 0, "seats": 9, "locked": True},
+]
+
+
+def enter_lobby(app, rooms=()):
+    app.sign_in()
+    app.handle_message(protocol.welcome("p1", "tok"))
+    app.handle_message(protocol.rooms(list(rooms)))
     return app.network
+
+
+def enter_table(app, table_state):
+    network = enter_lobby(app)
+    app.handle_message(protocol.room_joined("ABC234", "周五局", CONFIG))
+    app.handle_message(table_state)
+    return network
 
 
 LEGAL = LegalActions(frozenset({Action.FOLD, Action.CALL, Action.RAISE, Action.ALL_IN}), call_amount=1, min_raise_to=4, max_raise_to=99)
@@ -234,110 +223,172 @@ def test_next_step_skips_positions_with_the_same_amount(index, direction, expect
     assert next_step([4, 4, 4, 6, 8, 10, 12], index, direction) == expected
 
 
-# Lobby
+# Signing in and the room list
 
 
 def lobby_status(app):
     return texts(app, "lobby_status")
 
 
-def test_join_needs_a_nickname(app, scheduler):
+def test_signing_in_needs_a_nickname(app, scheduler):
     app.vars["nickname"].set("   ")
 
-    app.join_room()
+    app.sign_in()
 
     assert lobby_status(app) == ["请输入昵称"]
     assert app.network is None
 
 
-def test_join_connects_with_a_hello(app, scheduler):
-    app.vars["join_host"].set("10.0.0.5")
-    app.vars["join_port"].set("9000")
-    app.vars["join_password"].set("pw")
+def test_signing_in_says_hello_to_the_fixed_server(app, scheduler):
+    app.sign_in()
 
-    app.join_room()
-
-    assert app.network.connected == ("ws://10.0.0.5:9000", protocol.hello("alice", "pw"))
+    assert app.network.connected == (SERVER, protocol.hello("alice"))
     assert lobby_status(app) == ["正在连接…"]
-    assert not app.join_button.enabled
-    app.vars["join_password"].set("")
+    assert not app.sign_in_button.enabled
 
 
-@pytest.mark.parametrize("port", ["0", "70000", "abc", ""])
-def test_join_rejects_bad_ports(app, scheduler, port):
-    app.vars["join_port"].set(port)
+def test_a_refused_hello_stays_on_the_sign_in_screen_with_the_reason(app, scheduler):
+    app.sign_in()
+    network = app.network
 
-    app.join_room()
+    app.handle_message(protocol.error("nickname_taken", "taken"))
 
-    assert lobby_status(app) == ["端口必须是 1 到 65535 之间的整数"]
+    assert network.closed
+    assert app.screen == "login"
+    assert lobby_status(app) == ["这个昵称已经有人用了"]
 
 
-def test_create_room_starts_a_server_then_joins_it(app, scheduler):
+def test_failed_connection_is_reported(app, scheduler):
+    app.sign_in()
+
+    app.handle_message({"type": "_connect_failed", "reason": "refused"})
+
+    assert app.screen == "login"
+    assert lobby_status(app) == ["无法连接：refused"]
+
+
+def test_welcome_shows_the_room_list(app, scheduler):
+    enter_lobby(app, ROOMS)
+
+    assert app.screen == "rooms"
+    shown = texts(app, "room_rows")
+    assert ["周五局", "盲注 1 / 2", "3/9 人"] == shown[:3]
+    assert "需密码" in shown and "高额桌" in shown
+    assert app.vars["room_name"].get() == "alice的房间"
+
+
+def test_an_empty_list_invites_you_to_create_a_room(app, scheduler):
+    enter_lobby(app)
+
+    assert texts(app, "room_rows") == ["还没有房间，在右边创建一个吧"]
+
+
+def test_the_list_updates_while_you_watch(app, scheduler):
+    enter_lobby(app, ROOMS)
+
+    app.handle_message(protocol.rooms(ROOMS[1:]))
+
+    assert "周五局" not in texts(app, "room_rows")
+
+
+def test_clicking_an_open_room_joins_it(app, scheduler):
+    network = enter_lobby(app, ROOMS)
+
+    app.enter_room(ROOMS[0])
+    app.enter_room(ROOMS[0])  # a second click while waiting does nothing
+
+    assert network.sent == [protocol.join_room("ABC234")]
+    assert lobby_status(app) == ["正在进入房间…"]
+    app.handle_message(protocol.room_joined("ABC234", "周五局", CONFIG))
+    assert app.screen == "table"
+
+
+def test_a_locked_room_asks_for_its_password(app, scheduler):
+    network = enter_lobby(app, ROOMS)
+    app.answers.append("pw")
+
+    app.enter_room(ROOMS[1])
+
+    assert app.asked == ["「高额桌」需要密码才能进入"]
+    assert network.sent == [protocol.join_room("XYZ789", "pw")]
+    app.handle_message(protocol.error("bad_password", "wrong room password"))
+    assert app.screen == "rooms"
+    assert lobby_status(app) == ["房间密码不对"]
+
+
+def test_cancelling_the_password_sends_nothing(app, scheduler):
+    network = enter_lobby(app, ROOMS)
+
+    app.enter_room(ROOMS[1])
+
+    assert network.sent == []
+
+
+def test_create_room_sends_the_settings(app, scheduler):
+    network = enter_lobby(app)
     app.vars["blinds"].set("5/10")
     app.vars["bots"].set("2")
-    app.vars["create_port"].set("9100")
+    app.vars["room_password"].set("pw")
 
     app.create_room()
-    scheduler.run_until_idle()
 
-    server = FakeServer.instances[-1]
-    assert (server.config.big_blind, server.config.min_buy_in, server.config.max_buy_in) == (10, 200, 1000)
-    assert server.bots == 2
-    assert app.network.connected[0] == "ws://127.0.0.1:9100"
-    assert app.room_address.endswith(":9100")
+    assert network.sent == [protocol.create_room("alice的房间", 5, 10, password="pw", bots=2)]
+    assert not app.create_button.enabled
 
 
 @pytest.mark.parametrize(
-    "blinds, bots, message",
-    [("x", "0", "盲注要写成「小盲/大盲」，例如 1/2"), ("2/1", "0", "盲注要写成「小盲/大盲」，例如 1/2"), ("1/2", "9", "电脑玩家人数要在 0 到 8 之间")],
+    "name, blinds, bots, message",
+    [
+        ("x", "x", "0", "盲注要写成「小盲/大盲」，例如 1/2"),
+        ("x", "2/1", "0", "盲注要写成「小盲/大盲」，例如 1/2"),
+        ("x", "1/2", "6", "电脑玩家人数要在 0 到 5 之间"),
+        ("   ", "1/2", "0", "请输入房间名（最多 24 个字）"),
+        ("x" * 25, "1/2", "0", "请输入房间名（最多 24 个字）"),
+    ],
 )
-def test_create_room_validates_settings(app, scheduler, blinds, bots, message):
+def test_create_room_checks_the_settings_first(app, scheduler, name, blinds, bots, message):
+    network = enter_lobby(app)
+    app.vars["room_name"].set(name)
     app.vars["blinds"].set(blinds)
     app.vars["bots"].set(bots)
 
     app.create_room()
 
     assert lobby_status(app) == [message]
-    assert not FakeServer.instances
+    assert network.sent == []
 
 
-def test_create_room_reports_a_server_that_cannot_start(app, scheduler):
-    FakeServer.fail_with = "port in use"
-
+@pytest.mark.parametrize(
+    "code, message", [("too_many_rooms", "服务器上的房间已满，请稍后再试"), ("room_not_found", "这个房间已经关闭了")]
+)
+def test_room_errors_show_on_the_room_list(app, scheduler, code, message):
+    enter_lobby(app, ROOMS)
     app.create_room()
-    scheduler.run_until_idle()
 
-    assert lobby_status(app) == ["无法创建房间：port in use"]
-    assert app.network is None
+    app.handle_message(protocol.error(code, "whatever"))
+
+    assert lobby_status(app) == [message]
+    assert app.create_button.enabled
 
 
-def test_refused_join_returns_to_the_lobby_with_the_reason(app, scheduler):
-    app.join_room()
-    network = app.network
+def test_signing_out_goes_back_to_the_sign_in_screen(app, scheduler):
+    network = enter_lobby(app, ROOMS)
 
-    app.handle_message(protocol.error("bad_password", "wrong room password"))
+    app.sign_out()
 
     assert network.closed
-    assert app.screen == "lobby"
-    assert lobby_status(app) == ["房间密码不对"]
-
-
-def test_failed_connection_is_reported(app, scheduler):
-    app.join_room()
-
-    app.handle_message({"type": "_connect_failed", "reason": "refused"})
-
-    assert lobby_status(app) == ["无法连接：refused"]
+    assert app.screen == "login"
 
 
 # Table
 
 
-def test_welcome_and_state_open_the_table(app, scheduler):
+def test_room_joined_and_state_open_the_table(app, scheduler):
     enter_table(app, state(None, [seat(1, "bob")]))
 
     assert app.screen == "table"
     shown = texts(app)
+    assert any(text.startswith("周五局") for text in shown)
     assert "bob" in shown
     assert shown.count("点击入座") == 5
     assert "点击空座入座" in texts(app, "status")
@@ -611,25 +662,28 @@ def test_rebuy_asks_how_much_up_to_the_max_buy_in(app, scheduler):
     assert network.sent == [protocol.rebuy(100)]
 
 
-def test_leave_and_exit(app, scheduler):
+def test_leave_the_seat_then_the_room(app, scheduler):
     network = enter_table(app, state(0, [seat(0, "alice"), seat(1, "bob")]))
 
     app.leave_seat()
     app.exit_room()
+    assert network.sent == [protocol.leave(), protocol.leave_room()]
+    app.handle_message(protocol.room_left())
+    app.handle_message(protocol.rooms(ROOMS))
 
-    assert network.sent == [protocol.leave()]
-    assert network.closed
-    assert app.screen == "lobby"
+    assert not network.closed
+    assert app.screen == "rooms"
+    assert app.state is None
+    assert "周五局" in texts(app, "room_rows")
 
 
-def test_exiting_a_hosted_room_stops_its_server(app, scheduler):
-    app.create_room()
-    scheduler.run_until_idle()
-    app.handle_message(protocol.welcome("alice", "tok", CONFIG))
+def test_a_room_list_at_the_table_means_the_room_closed(app, scheduler):
+    enter_table(app, state(0, [seat(0, "alice")]))
 
-    app.exit_room()
+    app.handle_message(protocol.rooms(ROOMS[1:]))
 
-    assert FakeServer.instances[-1].stopped
+    assert app.screen == "rooms"
+    assert lobby_status(app) == ["你所在的房间已经关闭了"]
 
 
 def test_losing_the_connection_reconnects_with_the_token(app, scheduler):
@@ -643,9 +697,10 @@ def test_losing_the_connection_reconnects_with_the_token(app, scheduler):
     assert texts(app, "status") == ["连接断开，正在重连…"]
     assert not app.call_button.enabled and not app.leave_button.enabled
     scheduler.run_until_idle()
-    assert app.network.connected == ("ws://127.0.0.1:8765", protocol.hello("alice", None, "tok"))
+    assert app.network.connected == (SERVER, protocol.hello("alice", None, "tok"))
 
-    app.handle_message(protocol.welcome("alice", "tok", CONFIG))
+    app.handle_message(protocol.welcome("p1", "tok"))
+    app.handle_message(protocol.room_joined("ABC234", "周五局", CONFIG))
     app.handle_message(heads_up_preflop())
     app.handle_message(protocol.your_turn(1, 0, LEGAL, time_left=12))
 
@@ -662,7 +717,7 @@ def test_reconnecting_gives_up_after_many_failures(app, scheduler):
         scheduler.run_until_idle()
         app.handle_message({"type": "_connect_failed", "reason": "refused"})
 
-    assert app.screen == "lobby"
+    assert app.screen == "login"
     assert lobby_status(app) == ["与服务器的连接断开了"]
 
 
@@ -673,7 +728,7 @@ def test_a_refused_rejoin_returns_to_the_lobby(app, scheduler):
 
     app.handle_message(protocol.error("nickname_taken", "taken"))
 
-    assert app.screen == "lobby"
+    assert app.screen == "login"
     assert lobby_status(app) == ["这个昵称已经有人用了"]
 
 
@@ -682,8 +737,22 @@ def test_being_replaced_by_another_connection_returns_to_the_lobby(app, schedule
 
     app.handle_message(protocol.error("replaced", "you joined again"))
 
-    assert app.screen == "lobby"
-    assert lobby_status(app) == ["你在别处重新进入了这个房间"]
+    assert app.screen == "login"
+    assert lobby_status(app) == ["你用这个昵称在别处登录了"]
+
+
+def test_losing_the_connection_in_the_lobby_reconnects_too(app, scheduler):
+    enter_lobby(app, ROOMS)
+
+    app.handle_message({"type": "_disconnected"})
+    assert lobby_status(app) == ["连接断开，正在重连…"]
+    scheduler.run_until_idle()
+    app.handle_message(protocol.welcome("p1", "tok"))
+    app.handle_message(protocol.rooms(ROOMS))
+
+    assert app.screen == "rooms"
+    assert lobby_status(app) == []
+    assert "周五局" in texts(app, "room_rows")
 
 
 def test_sit_out_and_come_back(app, scheduler):

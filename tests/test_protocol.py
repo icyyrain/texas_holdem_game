@@ -12,6 +12,11 @@ from holdem.core.table import TableConfig
     [
         protocol.hello("alice"),
         protocol.hello("鲍勃", password="secret", token="abc"),
+        protocol.create_room("周五局", 1, 2),
+        protocol.create_room("High stakes", 50, 100, password="pw", bots=3),
+        protocol.join_room("ABC234"),
+        protocol.join_room("ABC234", "pw"),
+        protocol.leave_room(),
         protocol.sit(3, 200),
         protocol.leave(),
         protocol.action(Action.FOLD),
@@ -26,7 +31,8 @@ def test_client_messages_round_trip(message):
 
 
 def test_optional_client_fields_default_to_none():
-    assert protocol.decode_client('{"type":"hello","version":2,"nickname":"a"}') == protocol.hello("a")
+    assert protocol.decode_client('{"type":"hello","version":3,"nickname":"a"}') == protocol.hello("a")
+    assert protocol.decode_client('{"type":"join_room","room":"ABC234"}') == protocol.join_room("ABC234")
     assert protocol.decode_client('{"type":"action","action":"call"}') == protocol.action("call")
 
 
@@ -36,7 +42,10 @@ LEGAL = LegalActions(frozenset({Action.FOLD, Action.CALL, Action.RAISE}), call_a
 @pytest.mark.parametrize(
     "message",
     [
-        protocol.welcome("p1", "tok", TableConfig(1, 2, 40, 200)),
+        protocol.welcome("p1", "tok"),
+        protocol.rooms([{"id": "ABC234", "name": "周五局", "small_blind": 1, "big_blind": 2, "players": 3, "seats": 9, "locked": True}]),
+        protocol.room_joined("ABC234", "周五局", TableConfig(1, 2, 40, 200)),
+        protocol.room_left(),
         protocol.table_state(2, [None, {"seat": 1, "name": "bob", "cards": None}], {"street": "flop", "board": ["AS"]}),
         protocol.event(4, {"type": "action", "seat": 1, "action": "call", "amount": 2, "to": 2, "all_in": False}),
         protocol.your_turn(4, 1, LEGAL, time_left=12.5),
@@ -53,11 +62,9 @@ def test_your_turn_rebuilds_legal_actions():
     assert protocol.legal_from_turn(message) == LEGAL
 
 
-def test_welcome_carries_version_and_config():
-    message = protocol.welcome("p1", "tok", TableConfig(1, 2, 40, 200, max_seats=6))
-
-    assert message["version"] == protocol.PROTOCOL_VERSION
-    assert message["config"]["max_seats"] == 6
+def test_welcome_carries_the_version_and_room_joined_the_config():
+    assert protocol.welcome("p1", "tok")["version"] == protocol.PROTOCOL_VERSION
+    assert protocol.room_joined("ABC234", "x", TableConfig(1, 2, 40, 200, max_seats=6))["config"]["max_seats"] == 6
 
 
 @pytest.mark.parametrize(
@@ -76,6 +83,15 @@ def test_welcome_carries_version_and_config():
         '{"type":"sit","seat":1.0,"buy_in":100}',
         '{"type":"sit","seat":true,"buy_in":100}',
         '{"type":"rebuy","amount":null}',
+        '{"type":"create_room","name":"x","small_blind":1,"big_blind":2}',
+        '{"type":"create_room","name":"","small_blind":1,"big_blind":2,"bots":0}',
+        '{"type":"create_room","name":"' + "x" * 25 + '","small_blind":1,"big_blind":2,"bots":0}',
+        '{"type":"create_room","name":"x","small_blind":1,"big_blind":2,"bots":true}',
+        '{"type":"create_room","name":"x","small_blind":1,"big_blind":2,"bots":0,"password":"' + "x" * 65 + '"}',
+        '{"type":"join_room"}',
+        '{"type":"join_room","room":""}',
+        '{"type":"join_room","room":"' + "A" * 17 + '"}',
+        '{"type":"leave_room","room":"ABC234"}',
         '{"type":"away"}',
         '{"type":"away","away":1}',
         '{"type":"away","away":"no"}',

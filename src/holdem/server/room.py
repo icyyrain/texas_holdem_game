@@ -60,9 +60,17 @@ class Room:
         deck_factory: Callable[[], Deck] | None = None,
         clock: Callable[[], float] = time.monotonic,
         reconnect_grace: float = 120.0,
+        room_id: str = "",
+        name: str = "",
+        on_change: Callable[[], None] | None = None,
     ):
-        """``clock`` must count seconds the same way ``schedule`` does."""
+        """``clock`` must count seconds the same way ``schedule`` does. ``on_change`` is called after
+        every change, so a lobby can keep its room list current."""
         self.table = Table(config, deck_factory) if deck_factory else Table(config)
+        self.room_id = room_id
+        self.name = name
+        self.on_change = on_change
+        self.closed = False
         self.schedule = schedule
         self.clock = clock
         self.password = password or None
@@ -103,9 +111,10 @@ class Room:
         member = Member(secrets.token_hex(8), nickname, secrets.token_urlsafe(16), participant)
         self.members[member.player_id] = member
         self._names[member.player_id] = nickname
-        participant.deliver(protocol.welcome(member.player_id, member.token, self.table.config))
+        participant.deliver(protocol.room_joined(self.room_id, self.name, self.table.config))
         participant.deliver(self._state_for(member.player_id))
-        log.info("%s joined", nickname)
+        log.info("%s joined %s", nickname, self.name or "the room")
+        self._notify()
         return member
 
     def _rejoin(self, member: Member, participant: Participant) -> None:
@@ -116,7 +125,7 @@ class Room:
             self._away_offline.discard(member.player_id)
             seat.away = False
         log.info("%s reconnected", member.name)
-        participant.deliver(protocol.welcome(member.player_id, member.token, self.table.config))
+        participant.deliver(protocol.room_joined(self.room_id, self.name, self.table.config))
         turn = self._turn
         self._after_change()  # everyone sees them back; they get a fresh table_state
         # A turn that was already running when they came back is sent again, with its time left.
@@ -145,8 +154,28 @@ class Room:
             self.schedule(self.reconnect_grace, lambda: self._expire(member, session))
         self._after_change()
 
+    def remove(self, player_id: str) -> None:
+        """The player left the room on purpose: give up the seat (when the hand ends, if they are in it)."""
+        if self.members.pop(player_id, None) is None:
+            return
+        self._away_offline.discard(player_id)
+        if self.table.seat_of(player_id) is not None:
+            self.table.leave(player_id)
+        self._after_change()
+
+    def close(self) -> None:
+        """Stop the room for good: no more hands, timers or bot moves."""
+        self.closed = True
+
+    def humans(self) -> int:
+        """Connected members that are not bots."""
+        return sum(
+            1 for member in self.members.values()
+            if member.participant is not None and not isinstance(member.participant, BotPlayer)
+        )
+
     def _expire(self, member: Member, session: int) -> None:
-        if member.session != session or self.members.get(member.player_id) is not member:
+        if self.closed or member.session != session or self.members.get(member.player_id) is not member:
             return
         log.info("%s did not come back", member.name)
         del self.members[member.player_id]
@@ -189,7 +218,7 @@ class Room:
     def handle(self, player_id: str, message: protocol.Message) -> None:
         """Apply one validated client message; a refusal goes back to that player only."""
         member = self.members.get(player_id)
-        if member is None:
+        if member is None or self.closed:
             return
         kind = message["type"]
         try:
@@ -244,6 +273,11 @@ class Room:
         if new_turn:
             self._send_turn(seat)
         self._schedule_hand()
+        self._notify()
+
+    def _notify(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
 
     def _seat_to_act(self) -> Seat | None:
         if not self.table.hand_in_progress:
@@ -286,7 +320,7 @@ class Room:
             participant.deliver(protocol.your_turn(self.hand_number, seat.index, legal, self._time_left()))
 
     def _time_out(self, key: tuple[int, int, int]) -> None:
-        if key != self._turn or key != self._turn_key():
+        if self.closed or key != self._turn or key != self._turn_key():
             return
         seat = self._seat_to_act()
         log.info("%s ran out of time", self._names.get(seat.player_id, seat.player_id))
@@ -298,14 +332,14 @@ class Room:
         self._after_change()  # the seat is away now, so it plays itself
 
     def _schedule_hand(self) -> None:
-        if self._start_pending or self.table.hand_in_progress or self._ready_players() < 2:
+        if self.closed or self._start_pending or self.table.hand_in_progress or self._ready_players() < 2:
             return
         self._start_pending = True
         self.schedule(self.hand_delay, self._start_hand)
 
     def _start_hand(self) -> None:
         self._start_pending = False
-        if self.table.hand_in_progress or self._ready_players() < 2:
+        if self.closed or self.table.hand_in_progress or self._ready_players() < 2:
             return
         self.table.start_hand()
         self.hand_number += 1

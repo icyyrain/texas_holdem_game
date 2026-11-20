@@ -1,6 +1,9 @@
 param(
     [string]$EnvName = "holdem-game",
-    [string]$CondaExe = ""
+    [string]$CondaExe = "",
+    # The game server the exe connects to, e.g. wss://poker.example.com:8765. Saved in
+    # assets\server_url.txt (not in git) and reused by later builds when left out.
+    [string]$Server = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,6 +13,7 @@ Set-Location $ProjectRoot
 $ExePath = Join-Path $ProjectRoot "dist\Holdem.exe"
 $CardAssetsPath = Join-Path $ProjectRoot "assets\cards"
 $SmallCardAssetsPath = Join-Path $ProjectRoot "assets\cards_small"
+$ServerFile = Join-Path $ProjectRoot "assets\server_url.txt"
 $EntryScript = "src\holdem\client\app.py"
 
 if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot $EntryScript))) {
@@ -78,6 +82,17 @@ if (-not (Test-CardImages $SmallCardAssetsPath)) {
     }
 }
 
+if ($Server) {
+    if ($Server -notmatch "^wss?://") {
+        throw "-Server must start with ws:// or wss://, for example wss://poker.example.com:8765"
+    }
+    [System.IO.File]::WriteAllText($ServerFile, "$Server`n", (New-Object System.Text.UTF8Encoding $false))
+}
+if (-not (Test-Path -LiteralPath $ServerFile)) {
+    throw "No server address. Run once with -Server wss://your.server:8765; it is remembered in assets\server_url.txt."
+}
+Write-Host "Server: $((Get-Content -LiteralPath $ServerFile -TotalCount 1).Trim())"
+
 & $CondaExe run -n $EnvName python -m PyInstaller `
     --noconfirm `
     --clean `
@@ -87,6 +102,7 @@ if (-not (Test-CardImages $SmallCardAssetsPath)) {
     --specpath build `
     --add-data "$CardAssetsPath;assets\cards" `
     --add-data "$SmallCardAssetsPath;assets\cards_small" `
+    --add-data "$ServerFile;assets" `
     --paths src `
     $EntryScript
 

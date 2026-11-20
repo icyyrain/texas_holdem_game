@@ -63,7 +63,7 @@ class BotPlayer:
 
     def _act(self, hand_number: int, seat: int) -> None:
         table = self.room.table
-        if self.room.hand_number != hand_number or not table.hand_in_progress or table.hand.to_act != seat:
+        if self.room.closed or self.room.hand_number != hand_number or not table.hand_in_progress or table.hand.to_act != seat:
             return  # the turn passed while thinking (it timed out, or the bot stood up)
         action, amount = self.policy(situation_for(table.hand, seat), self.rng)
         self.room.handle(self.player_id, protocol.action(action, amount))

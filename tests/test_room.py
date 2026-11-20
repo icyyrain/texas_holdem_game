@@ -1,81 +1,12 @@
-import heapq
-import itertools
 import random
 
 import pytest
 
+from helpers import Client, FakeClock, seeded_decks
 from holdem import protocol, strategy
-from holdem.core.cards import Deck
 from holdem.core.table import TableConfig
 from holdem.server.room import JoinError, Room
 from holdem.strategy import smart_action
-
-
-class FakeClock:
-    """Collects scheduled callbacks so tests decide when time passes."""
-
-    def __init__(self):
-        self.now = 0.0
-        self.pending = []  # heap of (due, order, callback)
-        self._order = itertools.count()
-
-    def time(self):
-        return self.now
-
-    def schedule(self, delay, callback):
-        heapq.heappush(self.pending, (self.now + delay, next(self._order), callback))
-
-    def step(self):
-        """Jump to the next callback and run it; False if nothing is scheduled."""
-        if not self.pending:
-            return False
-        due, _, callback = heapq.heappop(self.pending)
-        self.now = max(self.now, due)
-        callback()
-        return True
-
-    def run(self, limit=10_000):
-        """Run everything due now, including what those callbacks schedule with no delay."""
-        self.advance(0, limit)
-
-    def advance(self, seconds, limit=10_000):
-        """Let ``seconds`` pass, running callbacks as they come due."""
-        target = self.now + seconds
-        for _ in range(limit):
-            if not self.pending or self.pending[0][0] > target:
-                self.now = target
-                return
-            self.step()
-        raise AssertionError("callbacks kept scheduling more callbacks")
-
-
-class Client:
-    def __init__(self):
-        self.messages = []
-
-    def deliver(self, message):
-        # Everything a room sends must survive the wire.
-        self.messages.append(protocol.decode_server(protocol.encode(message)))
-
-    def of_type(self, kind):
-        return [message for message in self.messages if message["type"] == kind]
-
-    def last(self, kind):
-        return self.of_type(kind)[-1]
-
-    def events(self, kind=None):
-        return [m["event"] for m in self.of_type("event") if kind is None or m["event"]["type"] == kind]
-
-
-def seeded_decks(seed=0):
-    rng = random.Random(seed)
-
-    def deck():
-        cards = Deck.standard()
-        cards.shuffle(rng)
-        return cards
-
-    return deck
 
 
 def make_room(password=None, **config):
@@ -91,11 +22,12 @@ def make_room(password=None, **config):
 def join(room, name, password=None, token=None):
     client = Client()
     member = room.join(client, name, password, token=token)
+    client.token = member.token  # a lobby keeps this to put the player back into the room
     return member.player_id, client
 
 
 def token_of(client):
-    return client.of_type("welcome")[0]["token"]
+    return client.token
 
 
 def seated_room(count=2):
@@ -108,14 +40,14 @@ def seated_room(count=2):
     return room, clock, players
 
 
-def test_join_sends_welcome_then_state():
+def test_join_sends_room_joined_then_state():
     room, _ = make_room()
-    player_id, client = join(room, "alice")
+    room.room_id, room.name = "ABC234", "Friday game"
+    join(room, "alice")
 
-    welcome, state = client.messages
-    assert welcome["type"] == "welcome"
-    assert welcome["player_id"] == player_id
-    assert welcome["config"]["big_blind"] == 2
+    joined, state = join(room, "bob")[1].messages
+    assert (joined["type"], joined["room"], joined["name"]) == ("room_joined", "ABC234", "Friday game")
+    assert joined["config"]["big_blind"] == 2
     assert state["type"] == "table_state"
     assert state["your_seat"] is None
     assert state["hand"] is None
@@ -292,8 +224,8 @@ def test_reconnecting_with_the_token_resumes_the_turn_with_the_time_left():
     same_id, client = join(room, "ignored", token=token_of(old_client))
 
     assert same_id == player_id
-    welcome, state, turn = client.messages
-    assert welcome["type"] == "welcome" and welcome["player_id"] == player_id
+    joined, state, turn = client.messages
+    assert joined["type"] == "room_joined"
     assert state["type"] == "table_state" and state["your_seat"] == actor
     assert state["seats"][actor]["cards"] is not None and state["seats"][actor]["connected"]
     assert state["hand"]["time_left"] == 20
@@ -323,8 +255,8 @@ def test_unknown_tokens_join_as_someone_new():
 
     player_id, client = join(room, "alice", token="no-such-token")
 
-    assert client.last("welcome")["player_id"] == player_id
-    assert client.last("welcome")["token"] != "no-such-token"
+    assert client.last("room_joined")
+    assert room.members[player_id].token != "no-such-token"
 
 
 def test_a_player_offline_at_the_end_of_a_hand_sits_out_and_comes_back_on_rejoin():
@@ -546,3 +478,54 @@ def test_a_bot_whose_turn_passed_while_thinking_does_nothing(monkeypatch):
 
     assert room.table.seats[0].away
     assert handled == []
+
+
+def test_removing_a_player_frees_their_seat_when_the_hand_ends():
+    room, clock, players = seated_room(3)
+    clock.run()
+    hand = room.table.hand
+    later = hand._seats_after(hand.to_act)[0]
+
+    room.remove(players[later][0])
+    room.handle(players[hand.to_act][0], protocol.action("call"))
+
+    assert players[later][0] not in room.members
+    assert hand.players[later].folded
+    play_out_with_folds(room, players)
+    assert room.table.seats[later] is None
+
+
+def test_a_closed_room_starts_no_hands_and_ignores_requests():
+    room, clock, players = seated_room(2)
+    clock.run()
+    play_out_with_folds(room, players)
+
+    room.close()
+    clock.advance(60)
+    room.handle(players[0][0], protocol.rebuy(10))
+
+    assert room.hand_number == 1
+    assert not players[0][1].of_type("error")
+
+
+def test_on_change_runs_after_every_change():
+    room, clock = make_room()
+    calls = []
+    room.on_change = lambda: calls.append(sum(seat is not None for seat in room.table.seats))
+    player_id, _ = join(room, "alice")
+
+    room.handle(player_id, protocol.sit(0, 100))
+
+    assert calls[-1] == 1
+
+
+def test_humans_counts_connected_people_but_not_bots():
+    room, _ = make_room()
+    room.add_bot("Bot 1", think=0)
+    alice, _ = join(room, "alice")
+    join(room, "bob")
+    room.handle(alice, protocol.sit(1, 100))
+
+    room.disconnect(alice)
+
+    assert room.humans() == 1
