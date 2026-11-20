@@ -55,6 +55,7 @@ from holdem.client.layout import (
     Point,
     bet_steps,
     nearest_step,
+    next_step,
     preset_amount,
     seat_positions,
     toward_center,
@@ -81,7 +82,15 @@ BET_FRACTION = 0.42
 NUMBER_FONT = "Segoe UI"
 FLIP_SCALES = (0.8, 0.6, 0.4, 0.2)
 ERROR = "#ff8a7a"
-PRESETS = (("btn_half_pot", 0.5), ("btn_three_quarter_pot", 0.75), ("btn_pot", 1.0), ("btn_all_in", None))
+PRESETS = (
+    ("btn_quarter_pot", 0.25), ("btn_half_pot", 0.5), ("btn_three_quarter_pot", 0.75), ("btn_pot", 1.0),
+    ("btn_all_in", None),
+)
+# Pot fractions marked above the raise slider, most useful first: a mark whose label would touch
+# one already drawn is left out.
+BET_MARKS = (("mark_pot", 1.0), ("mark_half_pot", 0.5), ("mark_quarter_pot", 0.25), ("mark_three_quarter_pot", 0.75))
+MARK_PADDING = 4
+SLIDER_X, SLIDER_LENGTH = 1076, 210
 JOIN_ERRORS = {
     "bad_password": "error_bad_password",
     "nickname_taken": "error_nickname_taken",
@@ -509,15 +518,19 @@ class HoldemApp(tk.Tk):
         self.call_button = CanvasButton(canvas, (737, CONTROL_Y), (132, 46), self.check_or_call, "secondary", tags)
         self.raise_button = CanvasButton(canvas, (884, CONTROL_Y), (150, 46), self.bet_or_raise, "primary", tags)
         self.preset_buttons = [
-            CanvasButton(canvas, (962 + 68 * index, 604), (62, 28), lambda f=fraction: self.preset(f), "ghost", tags)
+            CanvasButton(canvas, (950 + 54 * index, 604), (50, 28), lambda f=fraction: self.preset(f), "ghost", tags)
             for index, (_, fraction) in enumerate(PRESETS)
         ]
         self.raise_scale = tk.Scale(
-            canvas, from_=0, to=1, orient=tk.HORIZONTAL, variable=self.raise_index, showvalue=False, length=210,
+            canvas, from_=0, to=1, orient=tk.HORIZONTAL, variable=self.raise_index, showvalue=False,
+            length=SLIDER_LENGTH,
             command=lambda _value: self._update_controls(), bg=PANEL, troughcolor="#0f3a24", activebackground=GOLD,
             highlightthickness=0, sliderrelief="flat", bd=0,
         )
-        canvas.create_window(1076, CONTROL_Y, window=self.raise_scale, tags="table_ui")
+        canvas.create_window(SLIDER_X, CONTROL_Y, window=self.raise_scale, tags="table_ui")
+        # Several slider positions can share an amount; the arrow keys skip to the next different one.
+        for key, direction in (("<Left>", -1), ("<Down>", -1), ("<Right>", 1), ("<Up>", 1)):
+            self.raise_scale.bind(key, lambda _event, d=direction: self.step_raise(d))
         self.widgets.append(self.raise_scale)
         self._label_table_buttons()
         self._render()
@@ -532,7 +545,7 @@ class HoldemApp(tk.Tk):
         self.exit_button.set_text(self.t("btn_exit"), small)
         self.fold_button.set_text(self.t("btn_fold"), self._font(17, "bold"))
         for button, (key, _) in zip(self.preset_buttons, PRESETS):
-            button.set_text(self.t(key), self._font(12, "bold"))
+            button.set_text(self.t(key), self._font(11, "bold"))
 
     def _my_seat(self) -> protocol.Message | None:
         if self.state is None or self.state["your_seat"] is None:
@@ -577,9 +590,11 @@ class HoldemApp(tk.Tk):
             amount = steps[index]
             label = self.t("label_all_in", amount=amount) if amount == turn["max_raise_to"] else self.t(key, amount=amount)
             self.raise_button.set_text(label, self._font(15, "bold"))
+            self._draw_bet_marks(turn, amount)
         else:
             self.raise_scale.config(state=tk.DISABLED)
             self.raise_button.set_text(self.t(key, amount="").strip(), self._font(15, "bold"))
+            self.canvas.delete("marks")
         self.raise_button.set_enabled(can_raise)
         for button in self.preset_buttons:
             button.set_enabled(can_raise)
@@ -593,6 +608,49 @@ class HoldemApp(tk.Tk):
         away = seat is not None and seat["away"]
         self.away_button.set_text(self.t("btn_sit_back" if away else "btn_sit_out"), self._font(14, "bold"))
         self.away_button.set_enabled(online and seat is not None)
+
+    def _draw_bet_marks(self, turn: protocol.Message, amount: int) -> None:
+        """Tick marks above the slider where the pot-fraction bets fall; clicking one moves the slider there."""
+        canvas = self.canvas
+        canvas.delete("marks")
+        steps = self.raise_steps
+        if len(steps) < 2:
+            return
+        slider = int(self.raise_scale.cget("sliderlength"))
+        left, span = SLIDER_X - SLIDER_LENGTH / 2 + slider / 2, SLIDER_LENGTH - slider
+        taken: list[tuple[float, float]] = []
+        for key, fraction in BET_MARKS:
+            target = self._pot_target(turn, fraction)
+            if not turn["min_raise_to"] < target < turn["max_raise_to"]:
+                continue
+            index = nearest_step(steps, target)
+            x = left + span * index / (len(steps) - 1)
+            color = GOLD if steps[index] == amount else MUTED
+            tag = f"mark-{key}"
+            tags = ("table_ui", "marks", tag)
+            text = canvas.create_text(x, CONTROL_Y - 23, text=self.t(key), font=self._font(11, "bold"), fill=color, tags=tags)
+            x0, _, x1, _ = canvas.bbox(text)
+            if any(x0 < right + MARK_PADDING and x1 > start - MARK_PADDING for start, right in taken):
+                canvas.delete(text)
+                continue
+            taken.append((x0, x1))
+            canvas.create_line(x, CONTROL_Y - 15, x, CONTROL_Y - 9, fill=color, width=2, tags=tags)
+            canvas.tag_bind(tag, "<Button-1>", lambda _event, f=fraction: self.preset(f))
+
+    def step_raise(self, direction: int) -> str:
+        """Move the slider to the next different amount up or down (the arrow keys)."""
+        if self.raise_scale.cget("state") != tk.DISABLED and len(self.raise_steps) > 1:
+            index = min(max(self.raise_index.get(), 0), len(self.raise_steps) - 1)
+            self.raise_index.set(next_step(self.raise_steps, index, direction))
+            self._update_controls()
+        return "break"
+
+    def _pot_target(self, turn: protocol.Message, fraction: float) -> int:
+        """The raise-to amount for betting ``fraction`` of the pot, before snapping to a slider step."""
+        seats = [seat for seat in self.state["seats"] if seat is not None]
+        pot = sum(pot["amount"] for pot in self.state["hand"]["pots"]) + sum(seat["bet"] for seat in seats)
+        my_bet = self.state["seats"][turn["seat"]]["bet"]
+        return preset_amount(fraction, pot, my_bet, turn["call_amount"], turn["min_raise_to"], turn["max_raise_to"])
 
     def _steps_for_turn(self, turn: protocol.Message) -> list[int]:
         big_blind = self.config_info["big_blind"] if self.config_info else 1
@@ -635,14 +693,7 @@ class HoldemApp(tk.Tk):
         turn = self._active_turn()
         if turn is None or turn["min_raise_to"] is None:
             return
-        low, high = turn["min_raise_to"], turn["max_raise_to"]
-        if fraction is None:
-            amount = high
-        else:
-            seats = [seat for seat in self.state["seats"] if seat is not None]
-            pot = sum(pot["amount"] for pot in self.state["hand"]["pots"]) + sum(seat["bet"] for seat in seats)
-            my_bet = self.state["seats"][turn["seat"]]["bet"]
-            amount = preset_amount(fraction, pot, my_bet, turn["call_amount"], low, high)
+        amount = turn["max_raise_to"] if fraction is None else self._pot_target(turn, fraction)
         self._set_raise_amount(amount)
         self._update_controls()
 

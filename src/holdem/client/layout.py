@@ -14,6 +14,8 @@ SEAT_RADII = (478.0, 214.0)
 
 Point = tuple[float, float]
 
+SLIDER_STOPS = 80
+
 
 def seat_positions(max_seats: int, your_seat: int | None = None) -> list[Point]:
     """Anchor point of every seat around the oval, with ``your_seat`` (or seat 0) at the bottom.
@@ -45,20 +47,34 @@ def preset_amount(fraction: float, pot: int, my_bet: int, call_amount: int, min_
     return max(min_to, min(max_to, target))
 
 
-def bet_steps(min_to: int, max_to: int, step: int) -> list[int]:
-    """Amounts the raise slider stops at: the legal minimum, every multiple of ``step`` (the big
-    blind) above it, and the all-in amount. A convenience only; any amount in range is legal."""
+def bet_steps(min_to: int, max_to: int, step: int, stops: int = SLIDER_STOPS) -> list[int]:
+    """The amount at each of the raise slider's ``stops + 1`` positions: exponential from the legal
+    minimum to the all-in amount, rounded to multiples of ``step`` (the big blind). Small amounts
+    get as much of the slider as large ones, so neighbouring positions near the bottom often share
+    an amount. A convenience only; any amount in range is legal."""
     if max_to <= min_to:
         return [min_to]
-    first = (min_to // step + 1) * step
-    return [min_to, *range(first, max_to, step), max_to]
+    ratio = max_to / min_to
+    inner = (round(min_to * ratio ** (index / stops) / step) * step for index in range(1, stops))
+    return [min_to, *(min(max(amount, min_to), max_to) for amount in inner), max_to]
 
 
 def nearest_step(steps: list[int], amount: int) -> int:
-    """Index of the step closest to ``amount`` (the lower one on a tie)."""
+    """First position whose amount is closest to ``amount`` (the lower amount on a tie)."""
     index = bisect.bisect_left(steps, amount)
-    if index == 0:
-        return 0
     if index == len(steps):
-        return len(steps) - 1
-    return index if steps[index] - amount < amount - steps[index - 1] else index - 1
+        value = steps[-1]
+    elif index == 0 or steps[index] - amount < amount - steps[index - 1]:
+        value = steps[index]
+    else:
+        value = steps[index - 1]
+    return bisect.bisect_left(steps, value)
+
+
+def next_step(steps: list[int], index: int, direction: int) -> int:
+    """Position of the next different amount up (``direction`` 1) or down (-1) from ``index``."""
+    amount = steps[index]
+    if direction > 0:
+        return min(bisect.bisect_right(steps, amount), len(steps) - 1)
+    lower = bisect.bisect_left(steps, amount)
+    return bisect.bisect_left(steps, steps[lower - 1]) if lower > 0 else 0

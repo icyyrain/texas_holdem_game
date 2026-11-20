@@ -5,7 +5,8 @@ import pytest
 
 from holdem import protocol
 from holdem.client.app import HoldemApp
-from holdem.client.layout import HEIGHT, TABLE_CENTER, WIDTH, bet_steps, nearest_step, preset_amount, seat_positions
+from holdem.client.canvas_ui import GOLD, MUTED
+from holdem.client.layout import HEIGHT, TABLE_CENTER, WIDTH, bet_steps, nearest_step, next_step, preset_amount, seat_positions
 from holdem.core.betting import Action, LegalActions
 from holdem.core.table import TableConfig
 
@@ -192,22 +193,45 @@ def test_preset_amount(fraction, pot, my_bet, call, low, high, expected):
 
 
 @pytest.mark.parametrize(
-    "low, high, step, expected",
+    "low, high, step, amounts",
     [
         (4, 12, 2, [4, 6, 8, 10, 12]),
         (5, 12, 2, [5, 6, 8, 10, 12]),
         (18, 25, 2, [18, 20, 22, 24, 25]),
-        (20, 20, 2, [20]),
         (10, 13, 5, [10, 13]),
     ],
 )
-def test_bet_steps_keep_the_minimum_and_all_in(low, high, step, expected):
-    assert bet_steps(low, high, step) == expected
+def test_bet_steps_keep_the_minimum_and_all_in_and_round_to_the_big_blind(low, high, step, amounts):
+    steps = bet_steps(low, high, step)
+
+    assert len(steps) == 81
+    assert steps == sorted(steps)
+    assert sorted(set(steps)) == amounts
 
 
-@pytest.mark.parametrize("amount, index", [(1, 0), (4, 0), (5, 0), (6, 1), (7, 1), (11, 3), (13, 4), (99, 4)])
-def test_nearest_step(amount, index):
-    assert nearest_step([4, 6, 8, 10, 12], amount) == index
+def test_bet_steps_with_nothing_to_choose():
+    assert bet_steps(20, 20, 2) == [20]
+
+
+def test_bet_steps_are_exponential():
+    steps = bet_steps(2, 194, 2)
+
+    # A pot-sized bet of 12 sits well into the slider instead of squeezed against the left end.
+    assert 0.3 < nearest_step(steps, 12) / (len(steps) - 1) < 0.45
+    assert steps[len(steps) // 2] < 194 / 5
+    assert steps[-1] - steps[-2] > 5
+
+
+@pytest.mark.parametrize("amount, index", [(1, 0), (4, 0), (5, 0), (6, 3), (7, 3), (9, 4), (11, 5), (99, 6)])
+def test_nearest_step_picks_the_first_position_of_the_closest_amount(amount, index):
+    assert nearest_step([4, 4, 4, 6, 8, 10, 12], amount) == index
+
+
+@pytest.mark.parametrize(
+    "index, direction, expected", [(0, 1, 3), (1, 1, 3), (3, 1, 4), (6, 1, 6), (6, -1, 5), (3, -1, 0), (4, -1, 3), (0, -1, 0)]
+)
+def test_next_step_skips_positions_with_the_same_amount(index, direction, expected):
+    assert next_step([4, 4, 4, 6, 8, 10, 12], index, direction) == expected
 
 
 # Lobby
@@ -372,7 +396,7 @@ def test_fold_and_call_send_actions_once(app, scheduler):
 def test_raise_uses_the_slider_amount(app, scheduler):
     network = your_turn_ready(app, scheduler)
 
-    app.raise_index.set(13)  # 4, 6, 8, ... in big blinds of 2
+    app.raise_index.set(app.raise_steps.index(30))
     app._update_controls()
     assert app.raise_button.text == "加注到 30"
     app.bet_or_raise()
@@ -380,16 +404,19 @@ def test_raise_uses_the_slider_amount(app, scheduler):
     assert network.sent == [protocol.action("raise", 30)]
 
 
-def test_the_slider_moves_in_big_blinds_and_keeps_the_minimum_and_all_in(app, scheduler):
+def test_the_slider_moves_in_big_blind_steps_and_keeps_the_minimum_and_all_in(app, scheduler):
     legal = LegalActions(frozenset({Action.FOLD, Action.CALL, Action.RAISE, Action.ALL_IN}), call_amount=4, min_raise_to=9, max_raise_to=97)
     your_turn_ready(app, scheduler, legal)
 
-    assert app.raise_steps == [9, *range(10, 97, 2), 97]
+    assert app.raise_steps == bet_steps(9, 97, 2)
     assert (app.raise_scale.cget("from"), app.raise_scale.cget("to")) == (0, len(app.raise_steps) - 1)
     assert app.raise_button.text == "加注到 9"
-    app.raise_index.set(1)
-    app._update_controls()
-    assert app.raise_button.text == "加注到 10"
+    # The arrow keys always reach the next different amount, one big blind at a time down here.
+    for expected in ("加注到 10", "加注到 12", "加注到 14"):
+        app.step_raise(1)
+        assert app.raise_button.text == expected
+    app.step_raise(-1)
+    assert app.raise_button.text == "加注到 12"
     app.raise_index.set(len(app.raise_steps) - 1)
     app._update_controls()
     assert app.raise_button.text == "全下 97"
@@ -436,6 +463,72 @@ def test_check_is_offered_when_free(app, scheduler):
     assert app.raise_button.text == "下注 2"
     app.check_or_call()
     assert network.sent == [protocol.action("check")]
+
+
+def flop_bet_ready(app, scheduler, pot):
+    legal = LegalActions(frozenset({Action.FOLD, Action.CHECK, Action.BET, Action.ALL_IN}), min_raise_to=2, max_raise_to=98)
+    seats = [seat(0, "alice", 98, in_hand=True, cards=["AS", "KD"]), seat(1, "bob", 98, in_hand=True)]
+    pots = [{"amount": pot, "eligible": [0, 1]}]
+    enter_table(app, state(0, seats, hand(street="flop", board=["2C", "7D", "9H"], pots=pots, to_act=0)))
+    app.handle_message(protocol.your_turn(1, 0, legal))
+    scheduler.run_until_idle()
+
+
+def mark_x(app, key):
+    line = next(item for item in app.canvas.find_withtag(f"mark-{key}") if app.canvas.type(item) == "line")
+    return app.canvas.coords(line)[0]
+
+
+def test_pot_fractions_are_marked_above_the_slider(app, scheduler):
+    flop_bet_ready(app, scheduler, pot=12)
+
+    # 3/4 of the pot (9) would touch its neighbours' labels, so it is the one left out.
+    assert set(texts(app, "marks")) == {"1/4", "1/2", "满池"}
+    steps = app.raise_steps
+    slider = int(app.raise_scale.cget("sliderlength"))
+    left, span = 1076 - 105 + slider / 2, 210 - slider
+    assert mark_x(app, "mark_half_pot") == pytest.approx(left + span * steps.index(6) / (len(steps) - 1))
+    xs = [mark_x(app, key) for key in ("mark_quarter_pot", "mark_half_pot", "mark_pot")]
+    assert xs == sorted(xs)
+    labels = sorted(app.canvas.bbox(item) for item in app.canvas.find_withtag("marks") if app.canvas.type(item) == "text")
+    assert all(left_label[2] < right_label[0] for left_label, right_label in zip(labels, labels[1:]))
+
+    app.preset(0.5)
+    assert app.raise_button.text == "下注 6"
+    assert (mark_color(app, "mark_half_pot"), mark_color(app, "mark_pot")) == (GOLD, MUTED)
+
+
+def test_crowded_marks_keep_the_most_useful_ones(app, scheduler):
+    flop_bet_ready(app, scheduler, pot=40)
+
+    shown = texts(app, "marks")
+    assert "满池" in shown and "1/2" in shown
+    labels = sorted(app.canvas.bbox(item) for item in app.canvas.find_withtag("marks") if app.canvas.type(item) == "text")
+    assert all(left_label[2] < right_label[0] for left_label, right_label in zip(labels, labels[1:]))
+    app.preset(1.0)
+    assert app.raise_button.text == "下注 40"
+
+
+
+def mark_color(app, key):
+    text = next(item for item in app.canvas.find_withtag(f"mark-{key}") if app.canvas.type(item) == "text")
+    return app.canvas.itemcget(text, "fill")
+
+
+def test_marks_outside_the_range_are_left_out(app, scheduler):
+    flop_bet_ready(app, scheduler, pot=4)
+
+    # 1/4 and 1/2 of 4 are at or below the minimum bet of 2.
+    assert set(texts(app, "marks")) <= {"3/4", "满池"}
+    assert "满池" in texts(app, "marks")
+
+
+def test_the_quarter_pot_preset(app, scheduler):
+    flop_bet_ready(app, scheduler, pot=40)
+
+    app.preset(0.25)
+
+    assert app.raise_button.text == "下注 10"
 
 
 def snapshots(app, monkeypatch):
