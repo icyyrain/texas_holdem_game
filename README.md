@@ -1,6 +1,6 @@
 # Texas Hold'em Game
 
-A multiplayer No-Limit Texas Hold'em game for play chips only. Players connect a tkinter desktop client to one WebSocket server (for example on a VPS), pick a room from its lobby or open their own, and play. See the [design spec](docs/specs/2026-11-15-texas-holdem-design.md).
+A multiplayer No-Limit Texas Hold'em game for play chips only. Players connect a tkinter desktop client to a WebSocket server (one on a VPS, or one a player hosts on the local network), pick a room from its lobby or open their own, and play. See the [design spec](docs/specs/2026-11-15-texas-holdem-design.md).
 
 Working: the game rules, the server (a lobby with up to 10 rooms, room passwords, computer players, action timers and reconnecting), the desktop client (also as a Windows exe) and a minimal text client.
 
@@ -34,9 +34,13 @@ Type `f` fold, `x` check, `c` call, `b 10` bet 10, `r 30` raise to 30, `a` all-i
 conda run -n holdem-game python -m holdem.client
 ```
 
-The client always talks to one server; nobody types an address. A source checkout uses a server on this computer (`ws://127.0.0.1:8765`, so start `python -m holdem.server` first) unless `HOLDEM_SERVER` names another, and the exe carries the address it was built with (see below).
+Pick a nickname, then:
 
-Pick a nickname to enter the lobby. It lists every room with its blinds, players and whether it needs a password; click one to join (a locked room asks for its password). Or create a room on the right: a name, blinds, an optional password and up to 5 bots. **Leave Room** at the table goes back to the list; a room closes once nobody has been in it for 10 minutes.
+- **Enter lobby** goes to the usual server without asking for an address. The exe carries the address it was built with (see below); a source checkout uses a server on this computer (`ws://127.0.0.1:8765`, so start `python -m holdem.server` first) unless `HOLDEM_SERVER` names another.
+- **Host here** (local network) starts the same server inside your client and enters its lobby, which shows your LAN address for the others. The first time, Windows Firewall asks whether to let the game on the network; allow it on private networks or nobody can connect. Signing out or closing the client stops the server.
+- **Connect** joins someone else's server: type an IP, `IP:port` or a full `ws://` / `wss://` URL.
+
+The lobby lists every room with its blinds, players and whether it needs a password; click one to join (a locked room asks for its password). Or create a room on the right: a name, blinds, an optional password and up to 5 bots. **Leave Room** at the table goes back to the list; a room closes once nobody has been in it for 10 minutes.
 
 Click an empty seat to sit down. On your turn, use Fold, Check/Call, and Bet/Raise with the slider or the 1/2 pot, 3/4 pot, Pot and All-in presets. A bar under the player to act shows the time left; when it runs out the server checks or folds for them and sits them out. **Sit out** skips the next hands until you click **I'm back**. If the connection drops, the client reconnects to the same room and seat on its own.
 

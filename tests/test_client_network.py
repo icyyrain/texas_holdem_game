@@ -1,45 +1,27 @@
-import asyncio
+import contextlib
+import ipaddress
 import queue
 import socket
-import threading
 import time
 
 import pytest
 
 from holdem import protocol
 from holdem.client import settings
+from holdem.client.host import EmbeddedServer, lan_addresses
 from holdem.client.network import NetworkClient
-from holdem.server.app import start_server
 
 
-class ThreadedServer:
-    """A real game server on its own thread and loop, like the VPS but on a free local port."""
-
-    def __init__(self, **options):
-        self.options = options
-        self.ready = threading.Event()
-        self.port = None
-        self._loop = None
-        self._stop = None
-        self._thread = threading.Thread(target=asyncio.run, args=(self._main(),), daemon=True)
-
-    async def _main(self):
-        self._loop = asyncio.get_running_loop()
-        self._stop = asyncio.Event()
-        server, _ = await start_server(host="127.0.0.1", port=0, **self.options)
-        self.port = server.sockets[0].getsockname()[1]
-        self.ready.set()
-        async with server:
-            await self._stop.wait()
-
-    def __enter__(self):
-        self._thread.start()
-        assert self.ready.wait(5)
-        return self
-
-    def __exit__(self, *exc):
-        self._loop.call_soon_threadsafe(self._stop.set)
-        self._thread.join(5)
+@contextlib.contextmanager
+def built_in_server(**options):
+    """The client's built-in server on a free local port."""
+    server = EmbeddedServer(0, host="127.0.0.1", **options)
+    server.start()
+    assert server.ready.wait(5) and server.error is None
+    try:
+        yield server
+    finally:
+        server.stop()
 
 
 def wait_for(client, kind, timeout=5.0):
@@ -55,7 +37,7 @@ def wait_for(client, kind, timeout=5.0):
 
 
 def test_network_client_signs_in_creates_a_room_and_sits():
-    with ThreadedServer() as server:
+    with built_in_server() as server:
         client = NetworkClient()
         try:
             client.connect(f"ws://127.0.0.1:{server.port}", protocol.hello("alice"))
@@ -74,7 +56,7 @@ def test_network_client_signs_in_creates_a_room_and_sits():
 
 
 def test_a_refused_hello_ends_with_error_then_disconnect():
-    with ThreadedServer(password="pw") as server:
+    with built_in_server(password="pw") as server:
         client = NetworkClient()
         client.connect(f"ws://127.0.0.1:{server.port}", protocol.hello("alice", "nope"))
         assert wait_for(client, "error")["code"] == "bad_password"
@@ -89,6 +71,26 @@ def test_unreachable_server_reports_connect_failed():
     client.connect(f"ws://127.0.0.1:{port}", protocol.hello("alice"))
 
     assert wait_for(client, "_connect_failed")["reason"]
+
+
+def test_the_built_in_server_reports_a_busy_port():
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        server = EmbeddedServer(taken.getsockname()[1], host="127.0.0.1")
+        server.start()
+        assert server.ready.wait(5)
+
+    assert server.error
+    assert server.port is None
+
+
+def test_lan_addresses_are_ipv4_strings():
+    addresses = lan_addresses()
+
+    assert addresses
+    for address in addresses:
+        assert ipaddress.ip_address(address).version == 4
 
 
 @pytest.fixture

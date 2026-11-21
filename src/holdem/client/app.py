@@ -1,6 +1,7 @@
 """tkinter desktop client: sign in with a nickname, pick or create a room, then play at its table.
 
-The server address is fixed (see ``settings``). Everything is drawn on one Canvas. Server messages
+"Enter lobby" goes to the fixed server (see ``settings``). For a local network, "Host here" runs
+the same server inside the client (``host.EmbeddedServer``) and others "Connect" to its address. Everything is drawn on one Canvas. Server messages
 arrive on the network thread's queue and are polled with ``after``. Events become animation
 steps; while they play, the action buttons stay locked and the drawn view (``self.view``) lags
 the server's ``table_state`` (``self.state``), which replaces it once the queue drains.
@@ -44,6 +45,7 @@ from holdem.client.canvas_ui import (
     lerp_color,
 )
 from holdem.client.card_images import card_back_path, card_image_path
+from holdem.client.host import EmbeddedServer, lan_addresses
 from holdem.client.layout import (
     BOTTOM_RAIL_TOP,
     CONTROL_Y,
@@ -115,6 +117,7 @@ class HoldemApp(tk.Tk):
     def __init__(
         self,
         network_factory: Callable[[], NetworkClient] = NetworkClient,
+        server_factory: Callable[..., EmbeddedServer] = EmbeddedServer,
         ask_integer: AskInteger | None = None,
         ask_password: AskPassword | None = None,
         server: str | None = None,
@@ -124,9 +127,13 @@ class HoldemApp(tk.Tk):
         self.resizable(False, False)
         self.configure(bg=RAIL_DARK)
         self.network_factory = network_factory
+        self.server_factory = server_factory
         self.ask_integer = ask_integer or self._ask_integer
         self.ask_password = ask_password or self._ask_password
         self.server = server or server_url()
+        self.url = ""  # the server this session talks to: self.server, our own, or one typed in
+        self.local_server: EmbeddedServer | None = None  # running while we host
+        self.lan_address = ""  # what others type to join the server we host
         self.language = "zh"
         self.frame_ms = 16
         self.slide_frames = 10
@@ -160,6 +167,7 @@ class HoldemApp(tk.Tk):
             name: tk.StringVar(self, value)
             for name, value in (
                 ("nickname", ""), ("room_name", ""), ("blinds", "1/2"), ("room_password", ""), ("bots", "0"),
+                ("lan_port", str(protocol.DEFAULT_PORT)), ("lan_address", ""),
             )
         }
         # The raise slider picks an index into raise_steps (big-blind steps, see layout.bet_steps).
@@ -266,10 +274,14 @@ class HoldemApp(tk.Tk):
         self.lobby_status = status
         self._clear_screen()
         canvas = self.canvas
-        create_rounded_rect(canvas, 380, 220, 820, 470, 18, fill=PANEL, outline=GOLD_DARK, width=2, tags="lobby")
-        entry = self._lobby_entry("nickname", 650, 334, 220)
+        create_rounded_rect(canvas, 360, 120, 840, 590, 18, fill=PANEL, outline=GOLD_DARK, width=2, tags="lobby")
+        entry = self._lobby_entry("nickname", 650, 224, 220)
         entry.bind("<Return>", lambda _event: self.sign_in())
-        self.sign_in_button = CanvasButton(canvas, (600, 412), (200, 46), self.sign_in, "primary", tags=("lobby",))
+        self.sign_in_button = CanvasButton(canvas, (600, 296), (200, 46), self.sign_in, "primary", tags=("lobby",))
+        self._lobby_entry("lan_port", 560, 440, 110)
+        self.host_button = CanvasButton(canvas, (712, 440), (150, 38), self.host_here, "secondary", tags=("lobby",))
+        self._lobby_entry("lan_address", 590, 500, 170).bind("<Return>", lambda _event: self.connect_to())
+        self.connect_button = CanvasButton(canvas, (737, 500), (100, 38), self.connect_to, "secondary", tags=("lobby",))
         self._apply_language()
 
     def _lobby_entry(self, name: str, x: float, y: float, width: int, secret: bool = False) -> tk.Entry:
@@ -292,11 +304,19 @@ class HoldemApp(tk.Tk):
     def _draw_login_text(self) -> None:
         canvas = self.canvas
         tags = ("lobby", "lobby_text")
-        canvas.create_text(600, 266, text=self.t("login_hint"), font=self._font(20, "bold"), fill=GOLD, tags=tags)
-        canvas.create_text(528, 334, text=self.t("label_nickname"), anchor="e", font=self._font(16, "bold"), fill=CREAM, tags=tags)
-        self._draw_lobby_status(520)
+        canvas.create_text(600, 164, text=self.t("login_hint"), font=self._font(20, "bold"), fill=GOLD, tags=tags)
+        canvas.create_text(528, 224, text=self.t("label_nickname"), anchor="e", font=self._font(16, "bold"), fill=CREAM, tags=tags)
+        canvas.create_line(400, 362, 800, 362, fill=GOLD_DARK, tags=tags)
+        canvas.create_text(600, 388, text=self.t("lan_title"), font=self._font(15, "bold"), fill=GOLD, tags=tags)
+        canvas.create_text(495, 440, text=self.t("label_port"), anchor="e", font=self._font(15, "bold"), fill=CREAM, tags=tags)
+        canvas.create_text(495, 500, text=self.t("label_address"), anchor="e", font=self._font(15, "bold"), fill=CREAM, tags=tags)
+        canvas.create_text(600, 552, text=self.t("lan_hint"), font=self._font(13), fill=MUTED, tags=tags)
+        self._draw_lobby_status(612)
         self.sign_in_button.set_text(self.t("btn_enter_lobby"), self._font(17, "bold"))
-        self.sign_in_button.set_enabled(not self.connecting)
+        self.host_button.set_text(self.t("btn_host_here"), self._font(15, "bold"))
+        self.connect_button.set_text(self.t("btn_connect"), self._font(15, "bold"))
+        for button in (self.sign_in_button, self.host_button, self.connect_button):
+            button.set_enabled(not self.connecting)
 
     def _draw_lobby_status(self, y: float) -> None:
         if self.lobby_status:
@@ -318,16 +338,66 @@ class HoldemApp(tk.Tk):
         return nickname
 
     def sign_in(self) -> None:
-        if self.screen != "login" or self.connecting:
-            return
-        nickname = self._read_nickname()
+        """Enter the lobby of the fixed server."""
+        nickname = self._ready_to_connect()
+        if nickname is not None:
+            self._connect(self.server, nickname)
+
+    def host_here(self) -> None:
+        """Start the built-in server on this computer and enter its lobby."""
+        nickname = self._ready_to_connect()
         if nickname is None:
             return
+        text = self.vars["lan_port"].get().strip()
+        if not (text.isascii() and text.isdigit() and 1 <= int(text) <= 65535):
+            self._set_lobby_status("error_port")
+            return
+        self.local_server = self.server_factory(int(text))
+        self.local_server.start()
+        self.connecting = True
+        self._set_lobby_status("status_starting_server", is_error=False)
+        self._wait_for_server(nickname)
+
+    def _wait_for_server(self, nickname: str) -> None:
+        server = self.local_server
+        if server is None:
+            return
+        if not server.ready.is_set():
+            self._schedule(50, lambda: self._wait_for_server(nickname))
+            return
+        if server.error:
+            self.local_server = None
+            self.connecting = False
+            self._set_lobby_status("error_server_failed", reason=server.error)
+            return
+        self.lan_address = f"{lan_addresses()[0]}:{server.port}"
+        self._connect(f"ws://127.0.0.1:{server.port}", nickname)
+
+    def connect_to(self) -> None:
+        """Enter the lobby of a server someone else hosts: host, host:port or a ws:// / wss:// URL."""
+        nickname = self._ready_to_connect()
+        if nickname is None:
+            return
+        text = self.vars["lan_address"].get().strip()
+        if "://" not in text:
+            host, _, port = text.partition(":")
+            if not host or not port.isascii() or (port and not (port.isdigit() and 1 <= int(port) <= 65535)):
+                self._set_lobby_status("error_address")
+                return
+            text = f"ws://{host}:{port or protocol.DEFAULT_PORT}"
+        self._connect(text, nickname)
+
+    def _ready_to_connect(self) -> str | None:
+        if self.screen != "login" or self.connecting:
+            return None
+        return self._read_nickname()
+
+    def _connect(self, url: str, nickname: str) -> None:
         self.connecting = True
         self._session += 1
-        self.nickname, self.token = nickname, None
+        self.url, self.nickname, self.token = url, nickname, None
         self.network = self.network_factory()
-        self.network.connect(self.server, protocol.hello(nickname))
+        self.network.connect(url, protocol.hello(nickname))
         self._set_lobby_status("status_connecting", is_error=False)
 
     def sign_out(self) -> None:
@@ -340,7 +410,11 @@ class HoldemApp(tk.Tk):
         if self.network is not None:
             self.network.close()
             self.network = None
+        if self.local_server is not None:
+            self.local_server.stop()
+            self.local_server = None
         self.token = None
+        self.lan_address = ""
         self.rooms = []
         self._reset_table()
         self._show_login(status)
@@ -367,11 +441,13 @@ class HoldemApp(tk.Tk):
         if session != self._session or not self.reconnecting:
             return
         self.network = self.network_factory()
-        self.network.connect(self.server, protocol.hello(self.nickname, None, self.token))
+        self.network.connect(self.url, protocol.hello(self.nickname, None, self.token))
 
     def close(self) -> None:
         if self.network is not None:
             self.network.close()
+        if self.local_server is not None:
+            self.local_server.stop()
         self.destroy()
 
     # Room list
@@ -401,6 +477,12 @@ class HoldemApp(tk.Tk):
             690, 134, text=self.t("status_signed_in", name=self.nickname), anchor="e", font=self._font(14), fill=MUTED,
             tags=tags,
         )
+        if self.lan_address:
+            # Hosting: the address the others on this network type in to join.
+            canvas.create_text(
+                390, 580, text=self.t("lan_hosting", address=self.lan_address), font=self._font(14, "bold"), fill=GOLD,
+                tags=(*tags, "lan_address"),
+            )
         canvas.create_text(950, 134, text=self.t("btn_create_room"), font=self._font(22, "bold"), fill=GOLD, tags=tags)
         for key, y in (("label_room_name", 230), ("label_blinds", 290), ("label_password", 350), ("label_bots", 410)):
             canvas.create_text(910, y, text=self.t(key), anchor="e", font=self._font(15, "bold"), fill=CREAM, tags=tags)

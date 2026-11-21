@@ -1,4 +1,5 @@
 import queue
+import threading
 
 import pytest
 
@@ -45,6 +46,31 @@ class FakeNetwork:
         self.closed = True
 
 
+class FakeServer:
+    """Stands in for the built-in server behind "Host here"."""
+
+    instances = []
+    fail_with = None
+
+    def __init__(self, port):
+        self.requested_port = port
+        self.ready = threading.Event()
+        self.port = None
+        self.error = None
+        self.stopped = False
+        FakeServer.instances.append(self)
+
+    def start(self):
+        if FakeServer.fail_with:
+            self.error = FakeServer.fail_with
+        else:
+            self.port = self.requested_port
+        self.ready.set()
+
+    def stop(self):
+        self.stopped = True
+
+
 @pytest.fixture(scope="module")
 def app():
     networks = []
@@ -62,7 +88,9 @@ def app():
         app.asked.append(prompt)
         return answers.pop(0) if answers else None
 
-    app = HoldemApp(network_factory=new_network, ask_integer=ask, ask_password=ask_password, server=SERVER)
+    app = HoldemApp(
+        network_factory=new_network, server_factory=FakeServer, ask_integer=ask, ask_password=ask_password, server=SERVER
+    )
     app.networks, app.answers, app.asked = networks, answers, []
     app.update_idletasks()
     yield app
@@ -76,10 +104,15 @@ def scheduler(app, monkeypatch):
     app.sign_out()
     if app.language != "zh":
         app.toggle_language()
-    for name, value in (("nickname", "alice"), ("room_name", ""), ("blinds", "1/2"), ("room_password", ""), ("bots", "0")):
+    for name, value in (
+        ("nickname", "alice"), ("room_name", ""), ("blinds", "1/2"), ("room_password", ""), ("bots", "0"),
+        ("lan_port", "8765"), ("lan_address", ""),
+    ):
         app.vars[name].set(value)
     app.answers.clear()
     app.asked.clear()
+    FakeServer.instances.clear()
+    FakeServer.fail_with = None
     return fake
 
 
@@ -369,6 +402,86 @@ def test_room_errors_show_on_the_room_list(app, scheduler, code, message):
 
     assert lobby_status(app) == [message]
     assert app.create_button.enabled
+
+
+def test_host_here_starts_the_built_in_server_then_enters_its_lobby(app, scheduler, monkeypatch):
+    monkeypatch.setattr("holdem.client.app.lan_addresses", lambda: ["192.168.1.20"])
+    app.vars["lan_port"].set("9100")
+
+    app.host_here()
+    scheduler.run_until_idle()
+
+    assert FakeServer.instances[-1].requested_port == 9100
+    assert app.network.connected == ("ws://127.0.0.1:9100", protocol.hello("alice"))
+    app.handle_message(protocol.welcome("p1", "tok"))
+    app.handle_message(protocol.rooms([]))
+    assert app.screen == "rooms"
+    assert texts(app, "lan_address") == ["本机开服中 · 局域网地址 192.168.1.20:9100"]
+
+
+def test_host_here_checks_the_port_and_reports_a_server_that_cannot_start(app, scheduler):
+    app.vars["lan_port"].set("70000")
+    app.host_here()
+    assert lobby_status(app) == ["端口必须是 1 到 65535 之间的整数"]
+    assert not FakeServer.instances
+
+    app.vars["lan_port"].set("8765")
+    FakeServer.fail_with = "port in use"
+    app.host_here()
+    scheduler.run_until_idle()
+
+    assert lobby_status(app) == ["无法开服：port in use"]
+    assert app.network is None
+    assert app.sign_in_button.enabled
+
+
+@pytest.mark.parametrize(
+    "typed, url",
+    [
+        ("192.168.1.20", "ws://192.168.1.20:8765"),
+        ("192.168.1.20:9100", "ws://192.168.1.20:9100"),
+        ("wss://poker.example.com:8765", "wss://poker.example.com:8765"),
+    ],
+)
+def test_connect_goes_to_the_typed_address(app, scheduler, typed, url):
+    app.vars["lan_address"].set(typed)
+
+    app.connect_to()
+
+    assert app.network.connected == (url, protocol.hello("alice"))
+
+
+@pytest.mark.parametrize("typed", ["", ":8765", "192.168.1.20:port", "192.168.1.20:99999"])
+def test_connect_rejects_addresses_it_cannot_use(app, scheduler, typed):
+    app.vars["lan_address"].set(typed)
+
+    app.connect_to()
+
+    assert lobby_status(app) == ["地址要写成 IP 或「IP:端口」，例如 192.168.1.5:8765"]
+    assert app.network is None
+
+
+def test_signing_out_stops_the_server_we_host(app, scheduler):
+    app.host_here()
+    scheduler.run_until_idle()
+    app.handle_message(protocol.welcome("p1", "tok"))
+
+    app.sign_out()
+
+    assert FakeServer.instances[-1].stopped
+    assert app.lan_address == ""
+
+
+def test_reconnecting_goes_back_to_the_same_server(app, scheduler):
+    app.vars["lan_address"].set("192.168.1.20")
+    app.connect_to()
+    app.handle_message(protocol.welcome("p1", "tok"))
+    app.handle_message(protocol.rooms([]))
+
+    app.handle_message({"type": "_disconnected"})
+    scheduler.run_until_idle()
+
+    assert app.network.connected == ("ws://192.168.1.20:8765", protocol.hello("alice", None, "tok"))
 
 
 def test_signing_out_goes_back_to_the_sign_in_screen(app, scheduler):
